@@ -196,9 +196,26 @@ function detectAuthority(structuredAddress) {
 
   const { village, town, city, suburb, district, state, placeType, displayName } = structuredAddress;
 
-  // Strategy 1: Direct match against Municipal Corporations
-  const cityNames = [city, town, suburb, village].filter(Boolean);
-  for (const name of cityNames) {
+  // Strategy 1: If explicitly identified as a village, prioritize Gram Panchayat
+  if (village && normalize(village) !== normalize(city)) {
+    const corpMatch = matchInDataset(village, municipalCorporations);
+    if (!corpMatch) {
+      const councilMatch = matchInDataset(village, municipalCouncils);
+      if (!councilMatch) {
+        return {
+          authorityType: "gram_panchayat",
+          authorityTitle: "The Sarpanch",
+          authorityBody: `Gram Panchayat ${village}`,
+          confidence: 90,
+          detectionMethod: "village_priority",
+        };
+      }
+    }
+  }
+
+  // Strategy 2: Direct match against Municipal Corporations (city, town, suburb)
+  const urbanNames = [city, town, suburb].filter(Boolean);
+  for (const name of urbanNames) {
     const corpMatch = matchInDataset(name, municipalCorporations);
     if (corpMatch) {
       return {
@@ -212,34 +229,8 @@ function detectAuthority(structuredAddress) {
     }
   }
 
-  // Also check district name against corporations (e.g., "Kolhapur" district)
-  if (district) {
-    const corpByDistrict = matchInDataset(district, municipalCorporations);
-    if (corpByDistrict && (!village && !town && !city || normalize(city) === normalize(corpByDistrict.name))) {
-      return {
-        authorityType: "municipal_corporation",
-        authorityTitle: "The Municipal Commissioner",
-        authorityBody: `Municipal Corporation ${corpByDistrict.name}`,
-        confidence: 85,
-        detectionMethod: "dataset_corporation_district",
-        matchedEntry: corpByDistrict,
-      };
-    }
-  }
-
-  // Strategy 2: If Nominatim classifies as a village (no town/city), it's a Gram Panchayat
-  if (village && !town && !city) {
-    return {
-      authorityType: "gram_panchayat",
-      authorityTitle: "The Sarpanch",
-      authorityBody: `Gram Panchayat ${village}`,
-      confidence: 90,
-      detectionMethod: "nominatim_village_field",
-    };
-  }
-
-  // Strategy 3: Direct match against Municipal Councils (only for town/city areas)
-  for (const name of cityNames) {
+  // Strategy 3: Direct match against Municipal Councils (town, suburb, city)
+  for (const name of urbanNames) {
     const councilMatch = matchInDataset(name, municipalCouncils);
     if (councilMatch) {
       return {
@@ -253,7 +244,7 @@ function detectAuthority(structuredAddress) {
     }
   }
 
-  // If the location has a "town" field, it's likely a Municipal Council
+  // Strategy 4: If location has a "town" field
   if (town && !city) {
     return {
       authorityType: "municipal_council",
@@ -264,7 +255,7 @@ function detectAuthority(structuredAddress) {
     };
   }
 
-  // If the location has a "city" field, it could be a Municipal Corporation
+  // Strategy 5: If location has a "city" field
   if (city) {
     return {
       authorityType: "municipal_corporation",
@@ -273,6 +264,21 @@ function detectAuthority(structuredAddress) {
       confidence: 70,
       detectionMethod: "nominatim_city_field",
     };
+  }
+
+  // Strategy 6: Check district name against corporations if no specific village/town
+  if (district && !village && !town) {
+    const corpByDistrict = matchInDataset(district, municipalCorporations);
+    if (corpByDistrict) {
+      return {
+        authorityType: "municipal_corporation",
+        authorityTitle: "The Municipal Commissioner",
+        authorityBody: `Municipal Corporation ${corpByDistrict.name}`,
+        confidence: 75,
+        detectionMethod: "dataset_corporation_district",
+        matchedEntry: corpByDistrict,
+      };
+    }
   }
 
   // Default fallback — Gram Panchayat or Local Civic Authority
