@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "postinstall": "python3 -m pip install --no-cache-dir --break-system-packages ultralytics pillow --extra-index-url https://download.pytorch.org/whl/cpu || pip3 install --no-cache-dir --break-system-packages ultralytics pillow --extra-index-url https://download.pytorch.org/whl/cpu || true",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

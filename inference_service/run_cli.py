@@ -67,6 +67,7 @@ def main():
             max_c = dets[0]["confidence"] if dets else 0.0
             return dets, max_c
         except Exception as e:
+            print(f"Error running model {model_path}: {e}", file=sys.stderr)
             return [], 0.0
 
     if args.model in ["pothole", "both"]:
