@@ -202,6 +202,7 @@ export function cleanAddressString(addrStr) {
     .replace(/\b(?:mun[a-z]+)\s+corporation\b/gi, "")
     .replace(/\b(?:mun[a-z]+)\s+council\b/gi, "")
     .replace(/\b(?:gram\s+panchayat|nagar\s+palika|nagar\s+parishad|mahanagar\s+palika)\b/gi, "")
+    .replace(/\bunnamed\s*,?\s*/gi, "")
     .replace(/\s*\bin\b(?=\s*,|\s*$|\s+kolhapur|\s+maharashtra)/gi, "")
     .replace(/\bin\s*$/gi, "")
     .replace(/,?\s*[A-Z0-9]{2,}-[A-Z0-9]+/g, "")
@@ -236,6 +237,7 @@ export function cleanPlaceName(name) {
   if (/[0-9]{3,}/.test(trimmed)) return ""; // Has 3+ digits
   if (/^[0-9]+/.test(trimmed)) return ""; // Starts with numbers like street/door/plot
   if (/\+/.test(trimmed)) return ""; // Plus codes like 8F7X+9Q
+  if (/^unnamed$/i.test(trimmed)) return "";
 
   // Strip thoroughfare suffixes rather than discarding the whole place name
   // e.g. "Padli Khurd Road" -> "Padli Khurd", "Shingnapur Highway" -> "Shingnapur"
@@ -245,7 +247,7 @@ export function cleanPlaceName(name) {
     .trim();
 
   // Discard pure prepositions or adjectives that have no village noun
-  if (/^(?:main|near|opp|opposite|behind|front|beside|across|old|new)$/i.test(trimmed)) return "";
+  if (/^(?:main|near|opp|opposite|behind|front|beside|across|old|new|in|at)$/i.test(trimmed)) return "";
 
   return trimmed;
 }
@@ -260,8 +262,8 @@ export function detectAuthority(structuredAddress, lat = null, lng = null) {
 
   // Exact urban core boundary for Kolhapur Municipal Corporation (KMC)
   // Everything outside this box (e.g. Shingnapur, Padli Khurd, Balinge, Chikhali) is rural Gram Panchayat
-  const isKolhapurUrbanCore = hasCoords && (numLat >= 16.680 && numLat <= 16.715 && numLng >= 74.220 && numLng <= 74.255);
-  const isKolhapurRural = hasCoords && (numLng < 74.220 || numLng > 74.255 || numLat < 16.680 || numLat > 16.715);
+  const isKolhapurUrbanCore = hasCoords && (numLat >= 16.670 && numLat <= 16.735 && numLng >= 74.205 && numLng <= 74.260);
+  const isKolhapurRural = hasCoords && (numLng < 74.205 || numLng > 74.260 || numLat < 16.670 || numLat > 16.735);
 
   if (!structuredAddress) {
     if (isKolhapurRural) {
@@ -304,12 +306,12 @@ export function detectAuthority(structuredAddress, lat = null, lng = null) {
 
   // List of known urban wards inside Kolhapur Municipal Corporation (KMC)
   const knownKolhapurUrbanWards = [
-    "shahupuri", "rajarampuri", "laxmipuri", "tarabai park", "kasba bawada",
-    "phulewadi", "rankala", "mangalwar peth", "somwar peth", "shivaji peth",
+    "shahupuri", "rajarampuri", "laxmipuri", "tarabai park", "kasba bawada", "bawada",
+    "raman mala", "ramanmala", "phulewadi", "rankala", "mangalwar peth", "somwar peth", "shivaji peth",
     "shukrawar peth", "raviwar peth", "budhwar peth", "guruwar peth", "sambhajinagar",
     "ruikar colony", "nagala park", "kadamwadi", "sasane nagar", "line bazar",
     "pratibha nagar", "dabholkar corner", "station road", "cbs", "mahadwar road",
-    "bindu chowk", "dasara chowk", "bhavani mandap"
+    "bindu chowk", "dasara chowk", "bhavani mandap", "new palace", "temblaiwadi", "subhashnagar"
   ];
 
   const candidatePlaces = [village, suburb, town, city].filter(Boolean);
@@ -385,8 +387,9 @@ export function detectAuthority(structuredAddress, lat = null, lng = null) {
         };
       }
     }
-    const cleanP = cleanPlaceName(village || suburb || town);
-    const finalPlace = (cleanP && cleanP.toLowerCase() !== "kolhapur" && cleanP.toLowerCase() !== "pune") ? cleanP : "Local Village";
+    const candidateV = [village, suburb, town, city].find(p => p && !/^(?:kolhapur|pune|maharashtra|india|local village|unnamed)$/i.test(p.trim()));
+    const cleanP = candidateV ? cleanPlaceName(candidateV) : "";
+    const finalPlace = (cleanP && !/^(?:kolhapur|pune|maharashtra|india|local village|unnamed)$/i.test(cleanP)) ? cleanP : "Local Village";
     return {
       authorityType: "gram_panchayat",
       authorityTitle: "The Sarpanch",
