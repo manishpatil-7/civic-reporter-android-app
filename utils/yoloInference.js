@@ -1,7 +1,8 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
+import readline from "readline";
 import { promisify } from "util";
 import fetch from "node-fetch";
 import { fileURLToPath } from "url";
@@ -12,6 +13,114 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const CLI_SCRIPT_PATH = path.resolve(__dirname, "../inference_service/run_cli.py");
+const WORKER_SCRIPT_PATH = path.resolve(__dirname, "../inference_service/yolo_worker.py");
+
+let workerProcess = null;
+let workerReady = false;
+const pendingRequests = new Map();
+let requestIdCounter = 0;
+
+/**
+ * Initializes and manages a persistent in-memory YOLO worker.
+ * Eliminates cold-start PyTorch import overhead.
+ */
+function initWorker() {
+  if (workerProcess && !workerProcess.killed) return;
+
+  const pythonCmd = process.platform === "win32" ? "python" : "python3";
+  console.log("🚀 Spawning persistent in-memory YOLO worker...");
+
+  try {
+    workerProcess = spawn(pythonCmd, [WORKER_SCRIPT_PATH], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const rl = readline.createInterface({
+      input: workerProcess.stdout,
+      crlfDelay: Infinity,
+    });
+
+    rl.on("line", (line) => {
+      try {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        const data = JSON.parse(trimmed);
+        if (data.status === "ready") {
+          workerReady = true;
+          console.log("✅ Persistent YOLO worker ready in RAM:", data);
+          return;
+        }
+        if (data.id && pendingRequests.has(data.id)) {
+          const { resolve } = pendingRequests.get(data.id);
+          pendingRequests.delete(data.id);
+          resolve(data);
+        }
+      } catch (e) {
+        console.warn("Worker parse line error:", e.message, line.slice(0, 100));
+      }
+    });
+
+    workerProcess.stderr.on("data", (chunk) => {
+      console.log("Worker log:", chunk.toString().trim());
+    });
+
+    workerProcess.on("exit", (code, signal) => {
+      console.warn(`Worker process exited (code ${code}, signal ${signal})`);
+      workerProcess = null;
+      workerReady = false;
+      for (const [id, { reject }] of pendingRequests.entries()) {
+        reject(new Error(`Worker exited before responding to request ${id}`));
+      }
+      pendingRequests.clear();
+    });
+  } catch (err) {
+    console.error("Failed to spawn YOLO worker:", err.message);
+  }
+}
+
+// Pre-warm worker on application load
+initWorker();
+
+/**
+ * Executes inference through the persistent in-memory worker.
+ */
+async function runWorkerInference({ imagePath, modelType, confidenceThreshold }) {
+  initWorker();
+  const id = `req_${++requestIdCounter}_${Date.now()}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error("Worker inference timeout after 30s"));
+    }, 30000);
+
+    pendingRequests.set(id, {
+      resolve: (data) => {
+        clearTimeout(timer);
+        resolve(data);
+      },
+      reject: (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    });
+
+    const payload =
+      JSON.stringify({
+        id,
+        imagePath,
+        modelType,
+        conf: confidenceThreshold,
+      }) + "\n";
+
+    if (workerProcess && workerProcess.stdin.writable) {
+      workerProcess.stdin.write(payload);
+    } else {
+      clearTimeout(timer);
+      pendingRequests.delete(id);
+      reject(new Error("Worker stdin is not writable"));
+    }
+  });
+}
 
 /**
  * Checks if local weights are present on disk.
@@ -27,6 +136,7 @@ export function checkLocalModelsAvailable() {
       pothole: INFERENCE_CONFIG.potholeModelPath,
       garbage: INFERENCE_CONFIG.garbageModelPath,
     },
+    workerReady,
   };
 }
 
@@ -48,7 +158,7 @@ export async function checkYoloServiceHealth() {
   } catch (err) {
     // Service offline or connection refused
   }
-  return { online: false, localModels: checkLocalModelsAvailable() };
+  return { online: false, workerReady, localModels: checkLocalModelsAvailable() };
 }
 
 /**
@@ -72,7 +182,7 @@ async function runCliInference({ imagePath, modelType, confidenceThreshold }) {
 
   try {
     const { stdout, stderr } = await execFileAsync(pythonCmd, args, {
-      timeout: INFERENCE_CONFIG.cliTimeoutMs,
+      timeout: INFERENCE_CONFIG.cliTimeoutMs || 65000,
       maxBuffer: 1024 * 1024 * 10,
     });
     if (stderr) {
@@ -182,7 +292,21 @@ export async function runYoloInference({
       }
     }
 
-    // 3. Run CLI Python script
+    // 3. Run Inference: Try persistent in-memory worker first (~300ms warm execution)
+    try {
+      const workerRes = await runWorkerInference({
+        imagePath: resolvedPath,
+        modelType,
+        confidenceThreshold: threshold,
+      });
+      if (workerRes && workerRes.success) {
+        return workerRes;
+      }
+    } catch (workerErr) {
+      console.warn(`Persistent worker execution deferred (${workerErr.message}). Running CLI runner...`);
+    }
+
+    // 4. Fallback: Run direct CLI Python script
     const cliResult = await runCliInference({
       imagePath: resolvedPath,
       modelType,
