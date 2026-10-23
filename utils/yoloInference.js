@@ -31,7 +31,7 @@ function initWorker() {
   console.log("🚀 Spawning persistent in-memory YOLO worker...");
 
   try {
-    workerProcess = spawn(pythonCmd, [WORKER_SCRIPT_PATH], {
+    workerProcess = spawn(pythonCmd, ["-u", WORKER_SCRIPT_PATH], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -262,6 +262,19 @@ export async function runYoloInference({
       }
     }
 
+/**
+ * Optimizes Cloudinary or remote image URLs to 640px limit to minimize download latency and RAM.
+ */
+function getOptimizedImageUrl(url) {
+  if (!url || typeof url !== "string") return url;
+  if (url.includes("res.cloudinary.com") && url.includes("/upload/")) {
+    if (!url.includes("/upload/w_640")) {
+      return url.replace("/upload/", "/upload/w_640,c_limit,q_80/");
+    }
+  }
+  return url;
+}
+
     // 2. Prepare local file for CLI runner
     let resolvedPath = imagePath;
     if (!resolvedPath || !fs.existsSync(resolvedPath)) {
@@ -272,7 +285,8 @@ export async function runYoloInference({
         if (imageBuffer) {
           await fs.promises.writeFile(tempFilePath, imageBuffer);
         } else if (imageUrl) {
-          const response = await fetch(imageUrl, {
+          const downloadUrl = getOptimizedImageUrl(imageUrl);
+          const response = await fetch(downloadUrl, {
             headers: {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             },

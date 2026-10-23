@@ -198,14 +198,22 @@ export function cleanAddressString(addrStr) {
  */
 export function cleanPlaceName(name) {
   if (!name || typeof name !== "string") return "";
-  const trimmed = name.trim();
+  let trimmed = name.trim();
+  // Strip out "Pune Division" or "Kolhapur Division" or "in Pune Division" or "Division"
+  trimmed = trimmed
+    .replace(/,?\s*(?:in\s+)?[A-Za-z]+\s+division\b/gi, "")
+    .replace(/\bdivision\b/gi, "")
+    .replace(/,?\s*[A-Z0-9]{2,}-[A-Z0-9]+/g, "")
+    .replace(/\s*,\s*,/g, ", ")
+    .replace(/^[\s,]+|[\s,]+$/g, "")
+    .trim();
+
   // Filter out machine codes, plus codes, survey numbers, asset IDs like HPSBA-C393743
   if (/^[A-Z0-9]{2,}-[A-Z0-9]+$/i.test(trimmed)) return "";
   if (/[0-9]{3,}/.test(trimmed)) return ""; // Has 3+ digits
   if (/^[0-9]+/.test(trimmed)) return ""; // Starts with numbers like street/door/plot
   if (/\+/.test(trimmed)) return ""; // Plus codes like 8F7X+9Q
   if (/^road|^street|^lane|^gali|^marg|^plot|^survey|^sector/i.test(trimmed)) return "";
-  if (/division$/i.test(trimmed) || /division\b/i.test(trimmed)) return ""; // Filter out Pune Division
   return trimmed;
 }
 
@@ -394,9 +402,22 @@ export function generateLetterHeader(authorityResult, structuredAddress) {
 }
 
 // ===================================================
-// API ENDPOINT: POST /api/authority/detect
+// API ENDPOINT: GET & POST /api/authority/detect
 // ===================================================
+router.get("/detect", async (req, res, next) => {
+  req.body = {
+    latitude: req.query.lat || req.query.latitude,
+    longitude: req.query.lng || req.query.longitude,
+    address: req.query.address ? (typeof req.query.address === 'string' ? JSON.parse(req.query.address) : req.query.address) : null
+  };
+  return handleDetect(req, res);
+});
+
 router.post("/detect", async (req, res) => {
+  return handleDetect(req, res);
+});
+
+async function handleDetect(req, res) {
   try {
     const lat = req.body.lat !== undefined ? req.body.lat : req.body.latitude;
     const lng = req.body.lng !== undefined ? req.body.lng : req.body.longitude;
@@ -493,7 +514,7 @@ router.post("/detect", async (req, res) => {
     console.error("Authority detection error:", error.message);
     res.status(500).json({ message: error.message });
   }
-});
+}
 
 // ===================================================
 // AUTHORITY LOCATION BINDING ROUTES

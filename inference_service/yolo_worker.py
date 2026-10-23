@@ -11,6 +11,15 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["YOLO_VERBOSE"] = "False"
 os.environ["ULTRALYTICS_VERBOSE"] = "False"
 
+# Ensure line buffering for stdin/stdout
+try:
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(line_buffering=True)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 import json
 from PIL import Image
 
@@ -80,7 +89,10 @@ def run_model_inference(model, img, conf_threshold, target_label):
     max_c = dets[0]["confidence"] if dets else 0.0
     return dets, max_c
 
-for line in sys.stdin:
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
     line = line.strip()
     if not line:
         continue
