@@ -42,7 +42,13 @@ async function reverseGeocode(lat, lng) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 4000);
     const bdcUrl = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`;
-    const bdcRes = await fetch(bdcUrl, { signal: controller.signal });
+    const bdcRes = await fetch(bdcUrl, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+      },
+    });
     clearTimeout(timeout);
     if (bdcRes.ok) {
       const bdcData = await bdcRes.json();
@@ -209,7 +215,7 @@ function detectAuthority(structuredAddress) {
   // Also check district name against corporations (e.g., "Kolhapur" district)
   if (district) {
     const corpByDistrict = matchInDataset(district, municipalCorporations);
-    if (corpByDistrict && (!village || normalize(city) === normalize(corpByDistrict.name))) {
+    if (corpByDistrict && (!village && !town && !city || normalize(city) === normalize(corpByDistrict.name))) {
       return {
         authorityType: "municipal_corporation",
         authorityTitle: "The Municipal Commissioner",
@@ -320,29 +326,31 @@ router.post("/detect", async (req, res) => {
     const { lat, lng, address } = req.body;
 
     let structuredAddress = null;
-    let nominatimRaw = null;
 
-    // If lat/lng provided, reverse geocode
-    if (lat && lng) {
-      structuredAddress = await reverseGeocode(lat, lng);
-    }
-
-    // If structured address components provided directly
+    // If structured address components provided directly from mobile client
     if (address && typeof address === "object") {
       structuredAddress = {
-        village: address.village || "",
+        village: address.village || address.subLocality || address.name || "",
         town: address.town || "",
         city: address.city || "",
-        suburb: address.suburb || "",
-        district: address.district || "",
-        taluka: address.taluka || address.district || "",
-        state: address.state || "",
-        postcode: address.postcode || "",
+        suburb: address.suburb || address.district || "",
+        district: address.district || address.city || "",
+        taluka: address.taluka || address.subregion || address.district || "",
+        state: address.state || address.region || "",
+        postcode: address.postcode || address.postalCode || "",
         country: "India",
         placeType: "",
         placeClass: "",
-        displayName: "",
+        displayName: address.formattedAddress || address.displayName || "",
       };
+    }
+
+    // If lat/lng provided and address wasn't passed or is missing key fields, reverse geocode
+    if ((!structuredAddress || (!structuredAddress.village && !structuredAddress.city)) && lat && lng) {
+      const geo = await reverseGeocode(lat, lng);
+      if (geo) {
+        structuredAddress = { ...(structuredAddress || {}), ...geo };
+      }
     }
 
     // Detect authority
