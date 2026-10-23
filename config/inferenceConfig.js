@@ -12,12 +12,12 @@ export const INFERENCE_CONFIG = {
   potholeModelPath: process.env.POTHOLE_MODEL_PATH || path.resolve(__dirname, "../models/pothole_best.pt"),
   garbageModelPath: process.env.GARBAGE_MODEL_PATH || path.resolve(__dirname, "../models/garbage_best.pt"),
   
-  // Detection Confidence Thresholds
-  potholeConfidenceThreshold: parseFloat(process.env.POTHOLE_CONFIDENCE_THRESHOLD || "0.18"),
-  garbageConfidenceThreshold: parseFloat(process.env.GARBAGE_CONFIDENCE_THRESHOLD || "0.18"),
+  // Detection Confidence Thresholds (Optimized for real-world citizen smartphone photos)
+  potholeConfidenceThreshold: parseFloat(process.env.POTHOLE_CONFIDENCE_THRESHOLD || "0.10"),
+  garbageConfidenceThreshold: parseFloat(process.env.GARBAGE_CONFIDENCE_THRESHOLD || "0.10"),
   
   // High confidence threshold for automatic acceptance without Gemini
-  highConfidenceThreshold: 0.35,
+  highConfidenceThreshold: 0.20,
 
   // Timeouts (milliseconds)
   httpTimeoutMs: 1000,

@@ -35,12 +35,20 @@ def main():
         sys.exit(1)
 
     try:
-        img = Image.open(args.image).convert("RGB")
+        orig_img = Image.open(args.image).convert("RGB")
     except Exception as e:
         print(json.dumps({"success": False, "error": f"Failed to open image: {str(e)}"}))
         sys.exit(1)
 
-    w, h = img.size
+    w, h = orig_img.size
+    # Downscale for inference to keep RAM strictly <= 120MB on Render 512MB tier
+    infer_img = orig_img.copy()
+    if max(w, h) > 640:
+        infer_img.thumbnail((640, 640), Image.Resampling.LANCZOS)
+    iw, ih = infer_img.size
+    del orig_img
+    gc.collect()
+
     pothole_dets = []
     pothole_max_conf = 0.0
     garbage_dets = []
@@ -54,18 +62,23 @@ def main():
             torch.set_num_threads(1)
             model = YOLO(model_path)
             with torch.inference_mode():
-                results = model.predict(source=img, imgsz=480, conf=args.conf, verbose=False)
+                results = model.predict(source=infer_img, imgsz=480, conf=args.conf, verbose=False)
             dets = []
             if len(results) > 0 and results[0].boxes is not None:
                 for box in results[0].boxes:
                     conf = float(box.conf[0].item()) if hasattr(box.conf[0], 'item') else float(box.conf[0])
                     xyxy = box.xyxy[0].tolist()
                     x1, y1, x2, y2 = xyxy
-                    norm_x1 = max(0.0, min(1.0, x1 / w))
-                    norm_y1 = max(0.0, min(1.0, y1 / h))
-                    norm_x2 = max(0.0, min(1.0, x2 / w))
-                    norm_y2 = max(0.0, min(1.0, y2 / h))
-                    box_2d = [int(round(y1)), int(round(x1)), int(round(y2)), int(round(x2))]
+                    norm_x1 = max(0.0, min(1.0, x1 / iw))
+                    norm_y1 = max(0.0, min(1.0, y1 / ih))
+                    norm_x2 = max(0.0, min(1.0, x2 / iw))
+                    norm_y2 = max(0.0, min(1.0, y2 / ih))
+                    box_2d = [
+                        int(round(norm_y1 * h)),
+                        int(round(norm_x1 * w)),
+                        int(round(norm_y2 * h)),
+                        int(round(norm_x2 * w))
+                    ]
                     dets.append({
                         "box_2d": box_2d,
                         "normalized": {

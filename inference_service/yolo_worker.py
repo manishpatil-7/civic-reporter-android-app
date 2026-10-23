@@ -67,10 +67,12 @@ sys.stdout.write(json.dumps({
 }) + "\n")
 sys.stdout.flush()
 
-def run_model_inference(model, img, conf_threshold, target_label):
+def run_model_inference(model, img, conf_threshold, target_label, orig_w=None, orig_h=None):
     if model is None:
         return [], 0.0
-    w, h = img.size
+    iw, ih = img.size
+    orig_w = orig_w or iw
+    orig_h = orig_h or ih
     import torch
     with torch.inference_mode():
         results = model.predict(source=img, imgsz=480, conf=conf_threshold, verbose=False)
@@ -80,11 +82,16 @@ def run_model_inference(model, img, conf_threshold, target_label):
             conf = float(box.conf[0].item()) if hasattr(box.conf[0], 'item') else float(box.conf[0])
             xyxy = box.xyxy[0].tolist()
             x1, y1, x2, y2 = xyxy
-            norm_x1 = max(0.0, min(1.0, x1 / w))
-            norm_y1 = max(0.0, min(1.0, y1 / h))
-            norm_x2 = max(0.0, min(1.0, x2 / w))
-            norm_y2 = max(0.0, min(1.0, y2 / h))
-            box_2d = [int(round(y1)), int(round(x1)), int(round(y2)), int(round(x2))]
+            norm_x1 = max(0.0, min(1.0, x1 / iw))
+            norm_y1 = max(0.0, min(1.0, y1 / ih))
+            norm_x2 = max(0.0, min(1.0, x2 / iw))
+            norm_y2 = max(0.0, min(1.0, y2 / ih))
+            box_2d = [
+                int(round(norm_y1 * orig_h)),
+                int(round(norm_x1 * orig_w)),
+                int(round(norm_y2 * orig_h)),
+                int(round(norm_x2 * orig_w))
+            ]
             dets.append({
                 "box_2d": box_2d,
                 "normalized": {
@@ -121,8 +128,14 @@ while True:
             sys.stdout.flush()
             continue
 
-        img = Image.open(img_path).convert("RGB")
-        w, h = img.size
+        orig_img = Image.open(img_path).convert("RGB")
+        w, h = orig_img.size
+        infer_img = orig_img.copy()
+        if max(w, h) > 640:
+            infer_img.thumbnail((640, 640), Image.Resampling.LANCZOS)
+        iw, ih = infer_img.size
+        del orig_img
+        gc.collect()
 
         pothole_dets, pothole_max_conf = [], 0.0
         garbage_dets, garbage_max_conf = [], 0.0
@@ -130,7 +143,7 @@ while True:
         if model_type in ["pothole", "both"]:
             p_model = get_yolo_model("pothole")
             if p_model:
-                pothole_dets, pothole_max_conf = run_model_inference(p_model, img, conf, "Pothole")
+                pothole_dets, pothole_max_conf = run_model_inference(p_model, infer_img, conf, "Pothole", orig_w=w, orig_h=h)
 
         # When running both: if pothole confirmed with high confidence, skip loading garbage model to save RAM
         skip_garbage = (model_type == "both" and pothole_max_conf >= conf and len(pothole_dets) > 0)
@@ -138,7 +151,7 @@ while True:
         if model_type in ["garbage", "both"] and not skip_garbage:
             g_model = get_yolo_model("garbage")
             if g_model:
-                garbage_dets, garbage_max_conf = run_model_inference(g_model, img, conf, "Garbage accumulation")
+                garbage_dets, garbage_max_conf = run_model_inference(g_model, infer_img, conf, "Garbage accumulation", orig_w=w, orig_h=h)
 
         chosen_model = "none"
         chosen_label = "None"
