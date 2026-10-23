@@ -10,6 +10,7 @@ import {
   villageKeywords,
   urbanKeywords,
 } from "../data/authorityData.js";
+import fetch from "node-fetch";
 
 const router = express.Router();
 
@@ -354,7 +355,9 @@ function generateLetterHeader(authorityResult, structuredAddress) {
 // ===================================================
 router.post("/detect", async (req, res) => {
   try {
-    const { lat, lng, address } = req.body;
+    const lat = req.body.lat !== undefined ? req.body.lat : req.body.latitude;
+    const lng = req.body.lng !== undefined ? req.body.lng : req.body.longitude;
+    const address = req.body.address;
 
     let structuredAddress = null;
 

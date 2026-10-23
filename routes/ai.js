@@ -74,9 +74,13 @@ async function fetchImageBase64(imageUrl) {
       mimeType: "image/jpeg",
     };
   }
-  const imgResponse = await fetch(imageUrl);
+  const imgResponse = await fetch(imageUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    },
+  });
   if (!imgResponse.ok) {
-    throw new Error(`Failed to fetch image: ${imgResponse.statusText}`);
+    throw new Error(`Failed to fetch image (${imgResponse.status} ${imgResponse.statusText})`);
   }
   const arrayBuffer = await imgResponse.arrayBuffer();
   const base64Image = Buffer.from(arrayBuffer).toString("base64");

@@ -71,14 +71,23 @@ async function runCliInference({ imagePath, modelType, confidenceThreshold }) {
   ];
 
   try {
-    const { stdout } = await execFileAsync(pythonCmd, args, {
+    const { stdout, stderr } = await execFileAsync(pythonCmd, args, {
       timeout: INFERENCE_CONFIG.cliTimeoutMs,
       maxBuffer: 1024 * 1024 * 10,
     });
-    const parsed = JSON.parse(stdout.trim());
+    if (stderr) {
+      console.log("YOLO CLI stderr:", stderr.trim());
+    }
+    const trimmed = (stdout || "").trim();
+    const jsonStart = trimmed.indexOf("{");
+    const jsonEnd = trimmed.lastIndexOf("}") + 1;
+    if (jsonStart === -1 || jsonEnd === 0) {
+      throw new Error(`CLI output does not contain valid JSON: ${trimmed.slice(0, 200)}`);
+    }
+    const parsed = JSON.parse(trimmed.substring(jsonStart, jsonEnd));
     return parsed;
   } catch (err) {
-    console.error("YOLO CLI execution error:", err.message);
+    console.error("YOLO CLI execution error:", err.message, err.stderr || "");
     throw err;
   }
 }
@@ -155,7 +164,14 @@ export async function runYoloInference({
         if (imageBuffer) {
           await fs.promises.writeFile(tempFilePath, imageBuffer);
         } else if (imageUrl) {
-          const response = await fetch(imageUrl);
+          const response = await fetch(imageUrl, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+          });
+          if (!response.ok) {
+            throw new Error(`Failed to download image from URL (${response.status} ${response.statusText}): ${imageUrl}`);
+          }
           const arrayBuf = await response.arrayBuffer();
           await fs.promises.writeFile(tempFilePath, Buffer.from(arrayBuf));
         } else {

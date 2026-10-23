@@ -1,5 +1,10 @@
 import os
 import sys
+
+# Silence verbose Ultralytics and PyTorch stdout logs
+os.environ["YOLO_VERBOSE"] = "False"
+os.environ["ULTRALYTICS_VERBOSE"] = "False"
+
 import json
 import argparse
 from PIL import Image
