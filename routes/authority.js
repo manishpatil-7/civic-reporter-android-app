@@ -72,11 +72,6 @@ function extractNominatimAddress(nominatimData) {
 
   const addr = nominatimData.address;
 
-  return {
-    village: addr.village || addr.hamlet || addr.isolated_dwelling || "",
-    town: addr.town || addr.borough || "",
-    city: addr.city || addr.municipality || addr.city_district || "",
-    suburb: addr.suburb || addr.neighbourhood || addr.residential || "",
   let district = (addr.county || addr.district || "").replace(/\s*district$/i, "").trim();
   if (!district || /division/i.test(district)) {
     district = (addr.state_district && !/division/i.test(addr.state_district))
@@ -161,21 +156,18 @@ function normalize(str) {
  * Match a place name against the corporation/council datasets
  */
 function matchInDataset(placeName, dataset) {
-  const normalized = normalize(placeName);
-  if (!normalized) return null;
+  const normalized = normalize(cleanPlaceName(placeName));
+  if (!normalized || normalized.length < 3) return null;
 
   for (const entry of dataset) {
     const entryName = normalize(entry.name);
     const allNames = [entryName, ...entry.aliases.map(normalize)];
 
     for (const name of allNames) {
-      if (
-        normalized === name ||
-        normalized.includes(name) ||
-        name.includes(normalized)
-      ) {
-        return entry;
-      }
+      if (!name) continue;
+      if (normalized === name) return entry;
+      const regex = new RegExp(`\\b${name}\\b`, "i");
+      if (regex.test(normalized)) return entry;
     }
   }
   return null;
@@ -217,6 +209,9 @@ export function cleanAddressString(addrStr) {
 /**
  * Clean and filter place names (removes asset IDs, pole IDs, plus codes, survey numbers, divisions, authority words)
  */
+/**
+ * Clean and filter place names (removes asset IDs, pole IDs, plus codes, survey numbers, divisions, authority words, and thoroughfares)
+ */
 export function cleanPlaceName(name) {
   if (!name || typeof name !== "string") return "";
   let trimmed = name.trim();
@@ -236,9 +231,11 @@ export function cleanPlaceName(name) {
   if (/[0-9]{3,}/.test(trimmed)) return ""; // Has 3+ digits
   if (/^[0-9]+/.test(trimmed)) return ""; // Starts with numbers like street/door/plot
   if (/\+/.test(trimmed)) return ""; // Plus codes like 8F7X+9Q
-  if (/^road|^street|^lane|^gali|^marg|^plot|^survey|^sector/i.test(trimmed)) return "";
+  // Thoroughfares, highways, roads, streets should not be used as village names
+  if (/\b(?:road|street|marg|rasta|lane|gali|path|highway|nh\s*\d+|sh\s*\d+|bypass|chowk|circle|bridge|flyover)\b/i.test(trimmed)) return "";
   return trimmed;
 }
+
 
 /**
  * Main authority detection logic
@@ -264,10 +261,14 @@ export function detectAuthority(structuredAddress) {
   const knownGramPanchayats = [
     "shinganapur", "singanapur", "shingnapur", "padli khurd", "padli budruk", "padli",
     "balinge", "shiroli", "uchgaon", "uchgoan", "vadanage", "vadange", "nigave",
-    "chikhali", "kerli", "prayag chikhali", "gandhinagar", "kalamba",
+    "chikhali", "kerli", "kerle", "prayag chikhali", "gandhinagar", "kalamba",
     "pachgaon", "pachgoan", "morewadi", "gokul shirgaon", "tamgaon",
     "halondi", "mudshingi", "vasagade", "sarnobatwadi", "girgaon",
-    "kandgaon", "ambewadi", "kagal", "hatkanangle", "rukadi"
+    "kandgaon", "ambewadi", "kagal", "hatkanangle", "rukadi", "kuditre", "khupire",
+    "koparde", "kale", "kotoli", "beed", "panhala", "porle", "sawarde",
+    "vashi", "nandgaon", "chafodi", "bahirewadi", "rashivade", "ispurlie",
+    "hasur", "kanoor", "sadoli", "parite", "radhanagari", "bhudargad", "ajra",
+    "chandgad", "gadhinglaj", "gargoti", "murgud", "hupari"
   ];
 
   // List of known urban wards inside Kolhapur Municipal Corporation (KMC)
@@ -310,7 +311,7 @@ export function detectAuthority(structuredAddress) {
     }
   }
 
-  // Strategy 2: If place has village keywords (like "khurd", "budruk", "pur", "wadi", "gaon", etc.)
+  // Strategy 3: If village or suburb has village keywords (like "khurd", "budruk", "pur", "wadi", "gaon", etc.)
   for (const place of [village, suburb, town]) {
     if (place && hasVillageKeywords(place)) {
       const corpMatch = matchInDataset(place, municipalCorporations);
@@ -327,7 +328,18 @@ export function detectAuthority(structuredAddress) {
     }
   }
 
-  // Strategy 3: Check if town matches a Municipal Council
+  // Strategy 4: If village field is explicitly specified, it is ALWAYS Gram Panchayat
+  if (village) {
+    return {
+      authorityType: "gram_panchayat",
+      authorityTitle: "The Sarpanch",
+      authorityBody: `Gram Panchayat ${village}`,
+      confidence: 92,
+      detectionMethod: "village_field_priority",
+    };
+  }
+
+  // Strategy 5: Check if town matches a Municipal Council
   if (town) {
     const councilMatch = matchInDataset(town, municipalCouncils);
     if (councilMatch) {
@@ -342,7 +354,7 @@ export function detectAuthority(structuredAddress) {
     }
   }
 
-  // Strategy 4: Check if city matches a Municipal Corporation
+  // Strategy 6: Check if city matches a Municipal Corporation (only for core cities)
   if (city) {
     const corpMatch = matchInDataset(city, municipalCorporations);
     if (corpMatch) {
@@ -369,7 +381,7 @@ export function detectAuthority(structuredAddress) {
     }
   }
 
-  // Strategy 5: Check suburb against corporations
+  // Strategy 7: Check suburb against corporations
   if (suburb) {
     const corpMatch = matchInDataset(suburb, municipalCorporations);
     if (corpMatch) {
@@ -384,25 +396,24 @@ export function detectAuthority(structuredAddress) {
     }
   }
 
-  // Strategy 6: If village is specified and not corp/council, it's Gram Panchayat
-  if (village) {
+  // Default fallback: Gram Panchayat for rural places, else Kolhapur Municipal Corporation
+  const placeName = suburb || village || town;
+  if (placeName && placeName.toLowerCase() !== "kolhapur") {
     return {
       authorityType: "gram_panchayat",
       authorityTitle: "The Sarpanch",
-      authorityBody: `Gram Panchayat ${village}`,
-      confidence: 90,
-      detectionMethod: "village_field_priority",
+      authorityBody: `Gram Panchayat ${placeName}`,
+      confidence: 80,
+      detectionMethod: "fallback_rural",
     };
   }
 
-  // Default fallback: Gram Panchayat
-  const placeName = suburb || village || town || city || "Kolhapur";
   return {
-    authorityType: "gram_panchayat",
-    authorityTitle: "The Sarpanch",
-    authorityBody: `Gram Panchayat ${placeName}`,
-    confidence: 60,
-    detectionMethod: "fallback_rural",
+    authorityType: "municipal_corporation",
+    authorityTitle: "The Municipal Commissioner",
+    authorityBody: "Municipal Corporation Kolhapur",
+    confidence: 70,
+    detectionMethod: "fallback_kmc",
   };
 }
 

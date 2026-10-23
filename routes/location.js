@@ -2,6 +2,7 @@ import express from "express";
 import multer from "multer";
 import exifr from "exifr";
 import axios from "axios";
+import { cleanAddressString, cleanPlaceName } from "./authority.js";
 
 const router = express.Router();
 
@@ -47,14 +48,19 @@ async function reverseGeocode(lat, lng) {
       .replace(/^[\s,]+|[\s,]+$/g, "")
       .trim();
 
+    const cleanVillage = cleanPlaceName(addr.village || addr.hamlet || "");
+    const cleanTown = cleanPlaceName(addr.town || "");
+    const cleanCity = cleanPlaceName(addr.city || addr.municipality || "");
+    const cleanArea = cleanPlaceName(addr.suburb || addr.neighbourhood || addr.hamlet || addr.village || "");
+
     return {
-      state: addr.state || "",
+      state: cleanPlaceName(addr.state) || "Maharashtra",
       district: dist,
-      city: addr.city || addr.town || addr.village || "",
-      area: addr.suburb || addr.neighbourhood || addr.hamlet || "",
-      fullAddress: cleanFull,
-      village: addr.village || "",
-      town: addr.town || "",
+      city: cleanCity || cleanTown || cleanVillage || "Kolhapur",
+      area: cleanArea || cleanVillage || cleanCity || "",
+      village: cleanVillage,
+      town: cleanTown,
+      fullAddress: cleanAddressString(cleanFull) || "Kolhapur, Maharashtra",
       postcode: addr.postcode || "",
     };
   } catch (err) {
