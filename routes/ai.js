@@ -185,7 +185,13 @@ router.get("/status", async (req, res) => {
       const execFileAsync = promisify(execFile);
       const pythonCmd = process.platform === "win32" ? "python" : "python3";
       const { stdout } = await execFileAsync(pythonCmd, ["--version"]);
-      cliDiagnostic = `Python available: ${stdout.trim()}`;
+      cliDiagnostic = `Python: ${stdout.trim()}`;
+      try {
+        const { stdout: pipOut } = await execFileAsync(pythonCmd, ["-m", "pip", "--version"]);
+        cliDiagnostic += `, Pip: ${pipOut.trim()}`;
+      } catch (pipErr) {
+        cliDiagnostic += `, Pip error: ${pipErr.message}`;
+      }
       try {
         const { stdout: ultra } = await execFileAsync(pythonCmd, ["-c", "import ultralytics; print(ultralytics.__version__)"]);
         cliDiagnostic += `, ultralytics: ${ultra.trim()}`;
