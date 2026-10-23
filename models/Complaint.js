@@ -182,6 +182,12 @@ const complaintSchema = new mongoose.Schema({
     select: false, // Exclude from default queries (large array) — fetch explicitly when needed
   },
 
+  // YOLO neural detections (bounding boxes, confidence, label)
+  detections: {
+    type: Array,
+    default: [],
+  },
+
   createdAt: {
     type: Date,
     default: Date.now,

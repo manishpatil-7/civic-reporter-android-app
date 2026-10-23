@@ -103,6 +103,7 @@ router.post("/", async (req, res) => {
       authorityBody,
       locationSource,
       embedding, // AI-generated vector for duplicate detection
+      detections, // YOLO bounding boxes and labels
     } = req.body;
 
     // ✅ SAFE USER (no crash)
@@ -212,6 +213,7 @@ router.post("/", async (req, res) => {
       spamStatus,
       flagReason,
       verificationStatus: spamStatus === "flagged" ? "Suspicious" : "Pending",
+      detections: Array.isArray(detections) ? detections : [],
       // Store the embedding if provided (from duplicate check step)
       ...(embedding && embedding.length > 0 ? { embedding } : {}),
     });

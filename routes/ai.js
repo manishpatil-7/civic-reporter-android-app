@@ -285,11 +285,6 @@ router.post("/analyze", upload.single("image"), async (req, res) => {
       return res.status(400).json({ message: "Image URL or image file required" });
     }
 
-    // Parallelize local YOLO inference and Cloudinary upload if file buffer was uploaded
-    const uploadTask = (!imageUrl && imageBuffer)
-      ? uploadBufferToCloudinary(imageBuffer, req.file?.mimetype)
-      : Promise.resolve(null);
-
     const selectedCategory = (category || "").toLowerCase();
     const selectedProblemType = (problemType || "").toLowerCase();
 
@@ -316,16 +311,12 @@ router.post("/analyze", upload.single("image"), async (req, res) => {
     // ==============================================================
     if (isRoadDamage) {
       console.log("🛣️ Routing image to local YOLO model: pothole_best.pt");
-      const [yoloResult, uploadedUrl] = await Promise.all([
-        runYoloInference({
-          imageUrl,
-          imageBuffer,
-          modelType: "pothole",
-          confidenceThreshold: INFERENCE_CONFIG.potholeConfidenceThreshold,
-        }),
-        uploadTask,
-      ]);
-      imageUrl = imageUrl || uploadedUrl;
+      const yoloResult = await runYoloInference({
+        imageUrl,
+        imageBuffer,
+        modelType: "pothole",
+        confidenceThreshold: INFERENCE_CONFIG.potholeConfidenceThreshold,
+      });
 
       const hasHits = yoloResult.success && yoloResult.detectionCount > 0;
       const conf = hasHits ? yoloResult.maxConfidence : 0.65;
@@ -378,16 +369,12 @@ router.post("/analyze", upload.single("image"), async (req, res) => {
     // ==============================================================
     if (isGarbage) {
       console.log("🗑️ Routing image to local YOLO model: garbage_best.pt");
-      const [yoloResult, uploadedUrl] = await Promise.all([
-        runYoloInference({
-          imageUrl,
-          imageBuffer,
-          modelType: "garbage",
-          confidenceThreshold: INFERENCE_CONFIG.garbageConfidenceThreshold,
-        }),
-        uploadTask,
-      ]);
-      imageUrl = imageUrl || uploadedUrl;
+      const yoloResult = await runYoloInference({
+        imageUrl,
+        imageBuffer,
+        modelType: "garbage",
+        confidenceThreshold: INFERENCE_CONFIG.garbageConfidenceThreshold,
+      });
 
       const hasHits = yoloResult.success && yoloResult.detectionCount > 0;
       const conf = hasHits ? yoloResult.maxConfidence : 0.65;
@@ -440,11 +427,9 @@ router.post("/analyze", upload.single("image"), async (req, res) => {
     // ==============================================================
     if (isStreetlight) {
       console.log("💡 Routing image to Gemini Vision Primary Service for Streetlight Inspection");
-      if (!imageUrl && imageBuffer) {
-        imageUrl = (await uploadTask) || ("data:image/jpeg;base64," + imageBuffer.toString("base64"));
-      }
+      const stImageUrl = imageUrl || (imageBuffer ? "data:image/jpeg;base64," + imageBuffer.toString("base64") : "");
       return await handleStreetlightGeminiPrimary({
-        imageUrl,
+        imageUrl: stImageUrl,
         userName,
         locationAddress,
         authorityInfo,
@@ -456,19 +441,15 @@ router.post("/analyze", upload.single("image"), async (req, res) => {
     // ROUTE 4: UNSELECTED / UNIDENTIFIED CATEGORY
     // ==============================================================
     console.log("🔍 Category unselected. Running both local YOLO models first...");
-    const [multiYolo, uploadedUrl] = await Promise.all([
-      runYoloInference({
-        imageUrl,
-        imageBuffer,
-        modelType: "both",
-        confidenceThreshold: Math.min(
-          INFERENCE_CONFIG.potholeConfidenceThreshold,
-          INFERENCE_CONFIG.garbageConfidenceThreshold
-        ),
-      }),
-      uploadTask,
-    ]);
-    imageUrl = imageUrl || uploadedUrl;
+    const multiYolo = await runYoloInference({
+      imageUrl,
+      imageBuffer,
+      modelType: "both",
+      confidenceThreshold: Math.min(
+        INFERENCE_CONFIG.potholeConfidenceThreshold,
+        INFERENCE_CONFIG.garbageConfidenceThreshold
+      ),
+    });
 
     // Check if either local model produced a confident hit
     const potholeHits = multiYolo.allDetections?.pothole || [];
@@ -748,25 +729,6 @@ Return strictly valid JSON:
     });
   }
 }
-
-/**
- * Helper to upload image buffer to Cloudinary asynchronously
- */
-async function uploadBufferToCloudinary(buffer, mimetype = "image/jpeg") {
-  try {
-    const b64 = buffer.toString("base64");
-    const dataURI = `data:${mimetype};base64,${b64}`;
-    const result = await cloudinary.uploader.upload(dataURI, {
-      folder: "civic_reports",
-      resource_type: "image",
-    });
-    return result.secure_url;
-  } catch (err) {
-    console.warn("Cloudinary upload in direct inference:", err.message);
-    return null;
-  }
-}
-
 // ===================================================
 // DEDICATED ROAD DAMAGE DETECTION ENDPOINT
 // ===================================================
@@ -783,22 +745,12 @@ router.post("/road-damage/detect", upload.single("image"), async (req, res) => {
       ? parseFloat(req.body.confidence)
       : INFERENCE_CONFIG.potholeConfidenceThreshold;
 
-    // Parallelize local YOLO inference and Cloudinary upload if file buffer was uploaded
-    const uploadTask = (!imageUrl && imageBuffer)
-      ? uploadBufferToCloudinary(imageBuffer, req.file?.mimetype)
-      : Promise.resolve(null);
-
-    const [yoloRes, uploadedUrl] = await Promise.all([
-      runYoloInference({
-        imageUrl,
-        imageBuffer,
-        modelType: "pothole",
-        confidenceThreshold: confThreshold,
-      }),
-      uploadTask,
-    ]);
-
-    imageUrl = imageUrl || uploadedUrl || null;
+    const yoloRes = await runYoloInference({
+      imageUrl,
+      imageBuffer,
+      modelType: "pothole",
+      confidenceThreshold: confThreshold,
+    });
 
     if (yoloRes.success && yoloRes.detectionCount > 0 && yoloRes.maxConfidence >= confThreshold) {
       const severity = calculateYoloSeverity(yoloRes.detectionCount, yoloRes.maxConfidence);
@@ -889,22 +841,12 @@ router.post("/garbage/detect", upload.single("image"), async (req, res) => {
       ? parseFloat(req.body.confidence)
       : INFERENCE_CONFIG.garbageConfidenceThreshold;
 
-    // Parallelize local YOLO inference and Cloudinary upload if file buffer was uploaded
-    const uploadTask = (!imageUrl && imageBuffer)
-      ? uploadBufferToCloudinary(imageBuffer, req.file?.mimetype)
-      : Promise.resolve(null);
-
-    const [yoloRes, uploadedUrl] = await Promise.all([
-      runYoloInference({
-        imageUrl,
-        imageBuffer,
-        modelType: "garbage",
-        confidenceThreshold: confThreshold,
-      }),
-      uploadTask,
-    ]);
-
-    imageUrl = imageUrl || uploadedUrl || null;
+    const yoloRes = await runYoloInference({
+      imageUrl,
+      imageBuffer,
+      modelType: "garbage",
+      confidenceThreshold: confThreshold,
+    });
 
     if (yoloRes.success && yoloRes.detectionCount > 0 && yoloRes.maxConfidence >= confThreshold) {
       const severity = calculateYoloSeverity(yoloRes.detectionCount, yoloRes.maxConfidence);
