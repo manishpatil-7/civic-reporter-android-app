@@ -239,6 +239,25 @@ router.get("/status", async (req, res) => {
   }
 });
 
+router.get("/diag-yolo", async (req, res) => {
+  try {
+    const { promisify } = await import("util");
+    const { execFile } = await import("child_process");
+    const execFileAsync = promisify(execFile);
+    const pythonCmd = process.platform === "win32" ? "python" : "python3";
+
+    const testScript = "import sys\ntry:\n    import torch\n    print(f'torch: {torch.__version__}')\nexcept Exception as e:\n    print(f'torch error: {e}')\ntry:\n    from ultralytics import YOLO\n    print('ultralytics import ok')\n    m = YOLO('./models/pothole_best.pt')\n    print(f'pothole model load ok: {m.names}')\nexcept Exception as e:\n    print(f'YOLO load error: {e}')\n";
+
+    const { stdout, stderr } = await execFileAsync(pythonCmd, ["-c", testScript], {
+      timeout: 25000,
+    });
+
+    res.json({ stdout, stderr });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stderr: err.stderr, stdout: err.stdout });
+  }
+});
+
 // ===================================================
 // MAIN ANALYZE ENDPOINT (YOLO-FIRST + GEMINI FALLBACK)
 // ===================================================
