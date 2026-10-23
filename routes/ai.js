@@ -4,6 +4,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import fetch from "node-fetch";
+import cloudinary from "../config/cloudinary.js";
 import { supportedLanguages } from "../data/authorityData.js";
 import { INFERENCE_CONFIG } from "../config/inferenceConfig.js";
 import {
@@ -265,20 +266,29 @@ router.get("/diag-yolo", async (req, res) => {
 // ===================================================
 // MAIN ANALYZE ENDPOINT (YOLO-FIRST + GEMINI FALLBACK)
 // ===================================================
-router.post("/analyze", async (req, res) => {
+router.post("/analyze", upload.single("image"), async (req, res) => {
   try {
-    const {
-      imageUrl,
-      userName = "Concerned Citizen",
-      locationAddress = "",
-      authorityInfo = null,
-      category = "",
-      problemType = "",
-    } = req.body;
-
-    if (!imageUrl) {
-      return res.status(400).json({ message: "Image URL required" });
+    let imageUrl = req.body?.imageUrl;
+    let imageBuffer = req.file?.buffer;
+    const userName = req.body?.userName || "Concerned Citizen";
+    const locationAddress = req.body?.locationAddress || "";
+    let authorityInfo = req.body?.authorityInfo || null;
+    if (typeof authorityInfo === "string") {
+      try {
+        authorityInfo = JSON.parse(authorityInfo);
+      } catch {}
     }
+    const category = req.body?.category || "";
+    const problemType = req.body?.problemType || "";
+
+    if (!imageUrl && !imageBuffer) {
+      return res.status(400).json({ message: "Image URL or image file required" });
+    }
+
+    // Parallelize local YOLO inference and Cloudinary upload if file buffer was uploaded
+    const uploadTask = (!imageUrl && imageBuffer)
+      ? uploadBufferToCloudinary(imageBuffer, req.file?.mimetype)
+      : Promise.resolve(null);
 
     const selectedCategory = (category || "").toLowerCase();
     const selectedProblemType = (problemType || "").toLowerCase();
@@ -306,11 +316,16 @@ router.post("/analyze", async (req, res) => {
     // ==============================================================
     if (isRoadDamage) {
       console.log("🛣️ Routing image to local YOLO model: pothole_best.pt");
-      const yoloResult = await runYoloInference({
-        imageUrl,
-        modelType: "pothole",
-        confidenceThreshold: INFERENCE_CONFIG.potholeConfidenceThreshold,
-      });
+      const [yoloResult, uploadedUrl] = await Promise.all([
+        runYoloInference({
+          imageUrl,
+          imageBuffer,
+          modelType: "pothole",
+          confidenceThreshold: INFERENCE_CONFIG.potholeConfidenceThreshold,
+        }),
+        uploadTask,
+      ]);
+      imageUrl = imageUrl || uploadedUrl;
 
       const hasHits = yoloResult.success && yoloResult.detectionCount > 0;
       const conf = hasHits ? yoloResult.maxConfidence : 0.65;
@@ -363,11 +378,16 @@ router.post("/analyze", async (req, res) => {
     // ==============================================================
     if (isGarbage) {
       console.log("🗑️ Routing image to local YOLO model: garbage_best.pt");
-      const yoloResult = await runYoloInference({
-        imageUrl,
-        modelType: "garbage",
-        confidenceThreshold: INFERENCE_CONFIG.garbageConfidenceThreshold,
-      });
+      const [yoloResult, uploadedUrl] = await Promise.all([
+        runYoloInference({
+          imageUrl,
+          imageBuffer,
+          modelType: "garbage",
+          confidenceThreshold: INFERENCE_CONFIG.garbageConfidenceThreshold,
+        }),
+        uploadTask,
+      ]);
+      imageUrl = imageUrl || uploadedUrl;
 
       const hasHits = yoloResult.success && yoloResult.detectionCount > 0;
       const conf = hasHits ? yoloResult.maxConfidence : 0.65;
@@ -420,6 +440,9 @@ router.post("/analyze", async (req, res) => {
     // ==============================================================
     if (isStreetlight) {
       console.log("💡 Routing image to Gemini Vision Primary Service for Streetlight Inspection");
+      if (!imageUrl && imageBuffer) {
+        imageUrl = (await uploadTask) || ("data:image/jpeg;base64," + imageBuffer.toString("base64"));
+      }
       return await handleStreetlightGeminiPrimary({
         imageUrl,
         userName,
@@ -433,14 +456,19 @@ router.post("/analyze", async (req, res) => {
     // ROUTE 4: UNSELECTED / UNIDENTIFIED CATEGORY
     // ==============================================================
     console.log("🔍 Category unselected. Running both local YOLO models first...");
-    const multiYolo = await runYoloInference({
-      imageUrl,
-      modelType: "both",
-      confidenceThreshold: Math.min(
-        INFERENCE_CONFIG.potholeConfidenceThreshold,
-        INFERENCE_CONFIG.garbageConfidenceThreshold
-      ),
-    });
+    const [multiYolo, uploadedUrl] = await Promise.all([
+      runYoloInference({
+        imageUrl,
+        imageBuffer,
+        modelType: "both",
+        confidenceThreshold: Math.min(
+          INFERENCE_CONFIG.potholeConfidenceThreshold,
+          INFERENCE_CONFIG.garbageConfidenceThreshold
+        ),
+      }),
+      uploadTask,
+    ]);
+    imageUrl = imageUrl || uploadedUrl;
 
     // Check if either local model produced a confident hit
     const potholeHits = multiYolo.allDetections?.pothole || [];
@@ -722,140 +750,20 @@ Return strictly valid JSON:
 }
 
 /**
- * General Civic Fallback Handler using Gemini Vision
- * Triggered only when YOLO models fail, produce uncertain confidence, or for unselected categories.
+ * Helper to upload image buffer to Cloudinary asynchronously
  */
-async function handleGeminiCivicFallback({
-  imageUrl,
-  userName,
-  locationAddress,
-  authorityInfo,
-  fallbackReason,
-  expectedCategory,
-  res,
-}) {
+async function uploadBufferToCloudinary(buffer, mimetype = "image/jpeg") {
   try {
-    const { base64Image, mimeType } = await fetchImageBase64(imageUrl);
-
-    const promptText = `You are a civic infrastructure inspection AI with IMAGE VALIDATION capabilities.
-
-Determine whether this image shows a real civic/infrastructure maintenance issue or is non-civic/unrelated.
-
-NON-CIVIC (INVALID) images:
-- Selfies, personal photos, group portraits
-- Food, dishes, restaurant settings
-- Laptops, computers, screens, documents, certificates
-- Pets, indoor domestic animals, houseplants
-- Memes, artwork, cartoons, digital graphics
-- Vehicle interiors, dashboard cameras showing clear road with no defects
-
-VALID CIVIC ISSUES (pick closest):
-- "pothole" = road damage, asphalt crater, broken pavement
-- "garbage" = solid waste accumulation, uncollected trash, dump pile
-- "streetlight" = damaged street light fixture, bent pole, exposed wiring
-- "drainage" = blocked drain, sewer leakage, waterlogging
-- "other" = any other civic infrastructure issue (damaged bench, public toilet, broken railing, fallen tree)
-- "None" = image is NOT a civic issue
-
-Return strictly valid JSON:
-{
-  "imageValidation": {
-    "isValid": true/false,
-    "reason": "<concise explanation>",
-    "detectedContent": "<what is visible in the photo>"
-  },
-  "problemType": "<pothole|garbage|streetlight|drainage|other|None>",
-  "severity": "low" | "medium" | "high",
-  "confidence": <0 to 100>,
-  "description": "<2-3 line objective description of the issue>"
-}`;
-
-    const geminiData = await callGeminiVision(base64Image, mimeType, promptText);
-
-    // Rejection handling if image is not a civic issue
-    if (geminiData.imageValidation && !geminiData.imageValidation.isValid) {
-      return res.json({
-        imageUrl,
-        problemType: "None",
-        severity: "Low",
-        confidence: 0,
-        description: "No recognized civic infrastructure defect identified in this photograph.",
-        formalLetter: "",
-        priority: 0,
-        analysisProvider: "gemini",
-        geminiFallback: true,
-        fallbackReason,
-        imageValidation: geminiData.imageValidation,
-        canReportManually: true,
-      });
-    }
-
-    const normType = normalizeProblemType(geminiData.problemType);
-    const templateType = getTemplateType(normType);
-    const severity =
-      geminiData.severity === "high" ? "High" : geminiData.severity === "low" ? "Low" : "Medium";
-    const confidence =
-      geminiData.confidence > 1 ? geminiData.confidence / 100 : geminiData.confidence || 0.75;
-
-    // Generate letter deterministically (Section 8)
-    const formalLetter = generateDeterministicLetter({
-      templateType,
-      userName,
-      locationAddress,
-      authorityInfo,
-      problemType: normType,
-      severity,
+    const b64 = buffer.toString("base64");
+    const dataURI = `data:${mimetype};base64,${b64}`;
+    const result = await cloudinary.uploader.upload(dataURI, {
+      folder: "civic_reports",
+      resource_type: "image",
     });
-
-    return res.json({
-      success: true,
-      imageUrl,
-      problemType: normType,
-      severity,
-      confidence,
-      description:
-        geminiData.description || `Reported ${normType} issue at ${locationAddress || "specified location"}.`,
-      formalLetter,
-      priority: severity === "High" ? 30 : severity === "Medium" ? 20 : 10,
-      analysisProvider: "gemini",
-      geminiFallback: true,
-      fallbackReason,
-      imageValidation: geminiData.imageValidation || {
-        isValid: true,
-        reason: "Verified via Gemini Vision fallback inspection.",
-        detectedContent: normType,
-      },
-      canReportManually: true,
-    });
-  } catch (error) {
-    console.error("Gemini Civic Fallback Error:", error.message);
-    const resolvedType = expectedCategory ? normalizeProblemType(expectedCategory) : "Other";
-    const formalLetter = generateDeterministicLetter({
-      templateType: getTemplateType(resolvedType),
-      userName,
-      locationAddress,
-      authorityInfo,
-      problemType: resolvedType,
-      severity: "Medium",
-    });
-
-    return res.json({
-      problemType: resolvedType,
-      severity: "Medium",
-      description: "AI analysis encountered an error. Issue template initialized for manual review.",
-      formalLetter,
-      confidence: 0.6,
-      priority: 20,
-      analysisProvider: "gemini",
-      geminiFallback: true,
-      fallbackReason: "service_error",
-      imageValidation: {
-        isValid: true,
-        reason: "Service error — manual reporting permitted",
-        detectedContent: "unknown",
-      },
-      canReportManually: true,
-    });
+    return result.secure_url;
+  } catch (err) {
+    console.warn("Cloudinary upload in direct inference:", err.message);
+    return null;
   }
 }
 
@@ -875,12 +783,22 @@ router.post("/road-damage/detect", upload.single("image"), async (req, res) => {
       ? parseFloat(req.body.confidence)
       : INFERENCE_CONFIG.potholeConfidenceThreshold;
 
-    const yoloRes = await runYoloInference({
-      imageUrl,
-      imageBuffer,
-      modelType: "pothole",
-      confidenceThreshold: confThreshold,
-    });
+    // Parallelize local YOLO inference and Cloudinary upload if file buffer was uploaded
+    const uploadTask = (!imageUrl && imageBuffer)
+      ? uploadBufferToCloudinary(imageBuffer, req.file?.mimetype)
+      : Promise.resolve(null);
+
+    const [yoloRes, uploadedUrl] = await Promise.all([
+      runYoloInference({
+        imageUrl,
+        imageBuffer,
+        modelType: "pothole",
+        confidenceThreshold: confThreshold,
+      }),
+      uploadTask,
+    ]);
+
+    imageUrl = imageUrl || uploadedUrl || null;
 
     if (yoloRes.success && yoloRes.detectionCount > 0 && yoloRes.maxConfidence >= confThreshold) {
       const severity = calculateYoloSeverity(yoloRes.detectionCount, yoloRes.maxConfidence);
@@ -896,16 +814,24 @@ router.post("/road-damage/detect", upload.single("image"), async (req, res) => {
 
       return res.json({
         success: true,
+        imageUrl,
         problemType: "Pothole",
         severity,
         confidence: yoloRes.maxConfidence,
         description: `Verified road surface deterioration with ${yoloRes.detectionCount} prominent pothole depression(s) detected.`,
         formalLetter,
+        priority: severity === "High" ? 30 : severity === "Medium" ? 20 : 10,
         analysisProvider: "yolo",
         geminiFallback: false,
         model: "pothole_best",
         detections: yoloRes.detections,
         detectionCount: yoloRes.detectionCount,
+        imageValidation: {
+          isValid: true,
+          reason: `Local YOLO scan confirmed road damage with ${yoloRes.detectionCount} detection(s).`,
+          detectedContent: "pothole / asphalt damage",
+        },
+        canReportManually: true,
       });
     }
 
@@ -923,11 +849,13 @@ router.post("/road-damage/detect", upload.single("image"), async (req, res) => {
 
     return res.json({
       success: true,
+      imageUrl,
       problemType: "Pothole",
       severity,
       confidence: 0.65,
       description: "Road surface defect reported via local neural model. Physical municipal inspection requested.",
       formalLetter,
+      priority: 20,
       analysisProvider: "yolo",
       geminiFallback: false,
       model: "pothole_best",
@@ -961,12 +889,22 @@ router.post("/garbage/detect", upload.single("image"), async (req, res) => {
       ? parseFloat(req.body.confidence)
       : INFERENCE_CONFIG.garbageConfidenceThreshold;
 
-    const yoloRes = await runYoloInference({
-      imageUrl,
-      imageBuffer,
-      modelType: "garbage",
-      confidenceThreshold: confThreshold,
-    });
+    // Parallelize local YOLO inference and Cloudinary upload if file buffer was uploaded
+    const uploadTask = (!imageUrl && imageBuffer)
+      ? uploadBufferToCloudinary(imageBuffer, req.file?.mimetype)
+      : Promise.resolve(null);
+
+    const [yoloRes, uploadedUrl] = await Promise.all([
+      runYoloInference({
+        imageUrl,
+        imageBuffer,
+        modelType: "garbage",
+        confidenceThreshold: confThreshold,
+      }),
+      uploadTask,
+    ]);
+
+    imageUrl = imageUrl || uploadedUrl || null;
 
     if (yoloRes.success && yoloRes.detectionCount > 0 && yoloRes.maxConfidence >= confThreshold) {
       const severity = calculateYoloSeverity(yoloRes.detectionCount, yoloRes.maxConfidence);
@@ -982,16 +920,24 @@ router.post("/garbage/detect", upload.single("image"), async (req, res) => {
 
       return res.json({
         success: true,
+        imageUrl,
         problemType: "Garbage Dump",
         severity,
         confidence: yoloRes.maxConfidence,
         description: `Verified solid waste accumulation with ${yoloRes.detectionCount} dump cluster(s) detected.`,
         formalLetter,
+        priority: severity === "High" ? 30 : severity === "Medium" ? 20 : 10,
         analysisProvider: "yolo",
         geminiFallback: false,
         model: "garbage_best",
         detections: yoloRes.detections,
         detectionCount: yoloRes.detectionCount,
+        imageValidation: {
+          isValid: true,
+          reason: `Local YOLO scan confirmed garbage accumulation with ${yoloRes.detectionCount} detection(s).`,
+          detectedContent: "solid waste / garbage accumulation",
+        },
+        canReportManually: true,
       });
     }
 
@@ -1009,11 +955,13 @@ router.post("/garbage/detect", upload.single("image"), async (req, res) => {
 
     return res.json({
       success: true,
+      imageUrl,
       problemType: "Garbage Dump",
       severity,
       confidence: 0.65,
       description: "Solid waste accumulation reported via local neural model. Mechanized collection requested.",
       formalLetter,
+      priority: 20,
       analysisProvider: "yolo",
       geminiFallback: false,
       model: "garbage_best",
