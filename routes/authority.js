@@ -306,7 +306,7 @@ export function detectAuthority(structuredAddress, lat = null, lng = null) {
 
   // List of known urban wards inside Kolhapur Municipal Corporation (KMC)
   const knownKolhapurUrbanWards = [
-    "shahupuri", "rajarampuri", "laxmipuri", "tarabai park", "kasba bawada", "bawada",
+    "shahupuri", "rajarampuri", "laxmipuri", "tarabai park", "kasba bawada", "kasaba bawada", "bawada",
     "raman mala", "ramanmala", "phulewadi", "rankala", "mangalwar peth", "somwar peth", "shivaji peth",
     "shukrawar peth", "raviwar peth", "budhwar peth", "guruwar peth", "sambhajinagar",
     "ruikar colony", "nagala park", "kadamwadi", "sasane nagar", "line bazar",
