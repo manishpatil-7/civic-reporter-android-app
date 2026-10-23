@@ -178,6 +178,24 @@ router.get("/status", async (req, res) => {
     const localModels = checkLocalModelsAvailable();
     const serviceHealth = await checkYoloServiceHealth();
 
+    let cliDiagnostic = "unknown";
+    try {
+      const { promisify } = await import("util");
+      const { execFile } = await import("child_process");
+      const execFileAsync = promisify(execFile);
+      const pythonCmd = process.platform === "win32" ? "python" : "python3";
+      const { stdout } = await execFileAsync(pythonCmd, ["--version"]);
+      cliDiagnostic = `Python available: ${stdout.trim()}`;
+      try {
+        const { stdout: ultra } = await execFileAsync(pythonCmd, ["-c", "import ultralytics; print(ultralytics.__version__)"]);
+        cliDiagnostic += `, ultralytics: ${ultra.trim()}`;
+      } catch (uErr) {
+        cliDiagnostic += `, ultralytics error: ${uErr.message}`;
+      }
+    } catch (pErr) {
+      cliDiagnostic = `Python error: ${pErr.message}`;
+    }
+
     res.json({
       status: "online",
       architecture: "YOLO-First with Gemini Vision Fallback",
@@ -194,6 +212,7 @@ router.get("/status", async (req, res) => {
       inferenceService: {
         httpServiceActive: serviceHealth.online,
         cliFallbackReady: true,
+        cliDiagnostic,
       },
       geminiVision: {
         ready: !!visionModel,
