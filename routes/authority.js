@@ -221,6 +221,7 @@ export function cleanPlaceName(name) {
     .replace(/\b(?:mun[a-z]+)\s+corporation\b/gi, "")
     .replace(/\b(?:mun[a-z]+)\s+council\b/gi, "")
     .replace(/\b(?:gram\s+panchayat|nagar\s+palika|nagar\s+parishad|mahanagar\s+palika)\b/gi, "")
+    .replace(/\bin\s*$/gi, "")
     .replace(/,?\s*[A-Z0-9]{2,}-[A-Z0-9]+/g, "")
     .replace(/\s*,\s*,/g, ", ")
     .replace(/^[\s,]+|[\s,]+$/g, "")
@@ -231,17 +232,43 @@ export function cleanPlaceName(name) {
   if (/[0-9]{3,}/.test(trimmed)) return ""; // Has 3+ digits
   if (/^[0-9]+/.test(trimmed)) return ""; // Starts with numbers like street/door/plot
   if (/\+/.test(trimmed)) return ""; // Plus codes like 8F7X+9Q
-  // Thoroughfares, highways, roads, streets should not be used as village names
-  if (/\b(?:road|street|marg|rasta|lane|gali|path|highway|nh\s*\d+|sh\s*\d+|bypass|chowk|circle|bridge|flyover)\b/i.test(trimmed)) return "";
+
+  // Strip thoroughfare suffixes rather than discarding the whole place name
+  // e.g. "Padli Khurd Road" -> "Padli Khurd", "Shingnapur Highway" -> "Shingnapur"
+  trimmed = trimmed
+    .replace(/\b(?:road|street|marg|rasta|lane|gali|path|highway|nh\s*\d+|sh\s*\d+|bypass|chowk|circle|bridge|flyover)\b/gi, "")
+    .replace(/^[\s,]+|[\s,]+$/g, "")
+    .trim();
+
+  // Discard pure prepositions or adjectives that have no village noun
+  if (/^(?:main|near|opp|opposite|behind|front|beside|across|old|new)$/i.test(trimmed)) return "";
+
   return trimmed;
 }
 
-
 /**
- * Main authority detection logic
+ * Main authority detection logic with coordinate geofencing
  */
-export function detectAuthority(structuredAddress) {
+export function detectAuthority(structuredAddress, lat = null, lng = null) {
+  const numLat = parseFloat(lat);
+  const numLng = parseFloat(lng);
+  const hasCoords = !isNaN(numLat) && !isNaN(numLng) && numLat !== 0 && numLng !== 0;
+
+  // Exact urban core boundary for Kolhapur Municipal Corporation (KMC)
+  // Everything outside this box (e.g. Shingnapur, Padli Khurd, Balinge, Chikhali) is rural Gram Panchayat
+  const isKolhapurUrbanCore = hasCoords && (numLat >= 16.675 && numLat <= 16.720 && numLng >= 74.212 && numLng <= 74.260);
+  const isKolhapurRural = hasCoords && (numLng < 74.212 || numLng > 74.260 || numLat < 16.675 || numLat > 16.720);
+
   if (!structuredAddress) {
+    if (isKolhapurRural) {
+      return {
+        authorityType: "gram_panchayat",
+        authorityTitle: "The Sarpanch",
+        authorityBody: "Gram Panchayat Local Village",
+        confidence: 85,
+        detectionMethod: "rural_coordinate_geofence_no_addr",
+      };
+    }
     return {
       authorityType: "municipal_corporation",
       authorityTitle: "The Municipal Commissioner",
@@ -358,14 +385,19 @@ export function detectAuthority(structuredAddress) {
   if (city) {
     const corpMatch = matchInDataset(city, municipalCorporations);
     if (corpMatch) {
-      return {
-        authorityType: "municipal_corporation",
-        authorityTitle: "The Municipal Commissioner",
-        authorityBody: `Municipal Corporation ${corpMatch.name}`,
-        confidence: 95,
-        detectionMethod: "dataset_corporation_city",
-        matchedEntry: corpMatch,
-      };
+      if (corpMatch.name.toLowerCase() === "kolhapur" && isKolhapurRural) {
+        // Coordinate is outside central Kolhapur city limits (e.g. Shingnapur, Padli Khurd)
+        // Do not classify as Municipal Corporation!
+      } else {
+        return {
+          authorityType: "municipal_corporation",
+          authorityTitle: "The Municipal Commissioner",
+          authorityBody: `Municipal Corporation ${corpMatch.name}`,
+          confidence: 95,
+          detectionMethod: "dataset_corporation_city",
+          matchedEntry: corpMatch,
+        };
+      }
     }
 
     const councilMatch = matchInDataset(city, municipalCouncils);
@@ -385,14 +417,18 @@ export function detectAuthority(structuredAddress) {
   if (suburb) {
     const corpMatch = matchInDataset(suburb, municipalCorporations);
     if (corpMatch) {
-      return {
-        authorityType: "municipal_corporation",
-        authorityTitle: "The Municipal Commissioner",
-        authorityBody: `Municipal Corporation ${corpMatch.name}`,
-        confidence: 90,
-        detectionMethod: "dataset_corporation_suburb",
-        matchedEntry: corpMatch,
-      };
+      if (corpMatch.name.toLowerCase() === "kolhapur" && isKolhapurRural) {
+        // Skip
+      } else {
+        return {
+          authorityType: "municipal_corporation",
+          authorityTitle: "The Municipal Commissioner",
+          authorityBody: `Municipal Corporation ${corpMatch.name}`,
+          confidence: 90,
+          detectionMethod: "dataset_corporation_suburb",
+          matchedEntry: corpMatch,
+        };
+      }
     }
   }
 
@@ -405,6 +441,16 @@ export function detectAuthority(structuredAddress) {
       authorityBody: `Gram Panchayat ${placeName}`,
       confidence: 80,
       detectionMethod: "fallback_rural",
+    };
+  }
+
+  if (isKolhapurRural) {
+    return {
+      authorityType: "gram_panchayat",
+      authorityTitle: "The Sarpanch",
+      authorityBody: `Gram Panchayat ${placeName || "Local Village"}`,
+      confidence: 85,
+      detectionMethod: "fallback_rural_coords",
     };
   }
 
@@ -508,8 +554,8 @@ async function handleDetect(req, res) {
       }
     }
 
-    // Detect authority
-    const authorityResult = detectAuthority(structuredAddress);
+    // Detect authority with coordinates passed
+    const authorityResult = detectAuthority(structuredAddress, lat, lng);
 
     // Generate letter header
     const letterHeader = generateLetterHeader(authorityResult, structuredAddress);

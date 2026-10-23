@@ -1,7 +1,13 @@
 import os
 import sys
+import gc
 
-# Silence verbose Ultralytics and PyTorch stdout logs
+# Strict single-thread memory containment for Render 512MB RAM tier
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["YOLO_VERBOSE"] = "False"
 os.environ["ULTRALYTICS_VERBOSE"] = "False"
 
@@ -14,7 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description="Civic Reporter CLI YOLO Inference Runner")
     parser.add_argument("--image", required=True, help="Path to image file")
     parser.add_argument("--model", default="both", choices=["pothole", "garbage", "both"], help="Model to run")
-    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.18, help="Confidence threshold")
     parser.add_argument("--pothole-weights", default=None, help="Path to pothole_best.pt")
     parser.add_argument("--garbage-weights", default=None, help="Path to garbage_best.pt")
     args = parser.parse_args()
@@ -44,8 +50,11 @@ def main():
         if not os.path.exists(model_path):
             return [], 0.0
         try:
+            import torch
+            torch.set_num_threads(1)
             model = YOLO(model_path)
-            results = model.predict(source=img, imgsz=640, conf=args.conf, verbose=False)
+            with torch.inference_mode():
+                results = model.predict(source=img, imgsz=480, conf=args.conf, verbose=False)
             dets = []
             if len(results) > 0 and results[0].boxes is not None:
                 for box in results[0].boxes:
@@ -70,6 +79,9 @@ def main():
                     })
             dets.sort(key=lambda d: d["confidence"], reverse=True)
             max_c = dets[0]["confidence"] if dets else 0.0
+            del model
+            del results
+            gc.collect()
             return dets, max_c
         except Exception as e:
             print(f"Error running model {model_path}: {e}", file=sys.stderr)
@@ -78,7 +90,10 @@ def main():
     if args.model in ["pothole", "both"]:
         pothole_dets, pothole_max_conf = run_model(pothole_path, "Pothole")
 
-    if args.model in ["garbage", "both"]:
+    # When running both: if pothole confirmed with high confidence, skip loading garbage model to save RAM
+    skip_garbage = (args.model == "both" and pothole_max_conf >= args.conf and len(pothole_dets) > 0)
+
+    if args.model in ["garbage", "both"] and not skip_garbage:
         garbage_dets, garbage_max_conf = run_model(garbage_path, "Garbage accumulation")
 
     chosen_model = "none"

@@ -28,26 +28,35 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 POTHOLE_PATH = os.environ.get("POTHOLE_MODEL_PATH", os.path.join(MODELS_DIR, "pothole_best.pt"))
 GARBAGE_PATH = os.environ.get("GARBAGE_MODEL_PATH", os.path.join(MODELS_DIR, "garbage_best.pt"))
 
-# Lazy cache for loaded models (keeps RAM under 200MB)
-models_cache = {}
+# Only keep at most ONE active model in memory to guarantee RAM <= 220MB on Render 512MB tier
+current_loaded_type = None
+current_model = None
 
 def get_yolo_model(model_type):
-    from ultralytics import YOLO
+    global current_loaded_type, current_model
     import torch
+    from ultralytics import YOLO
     torch.set_num_threads(1)
 
-    if model_type == "pothole":
-        if "pothole" not in models_cache:
-            if os.path.exists(POTHOLE_PATH):
-                models_cache["pothole"] = YOLO(POTHOLE_PATH)
-                sys.stderr.write(f"Worker: Loaded pothole model from {POTHOLE_PATH}\n")
-        return models_cache.get("pothole")
-    elif model_type == "garbage":
-        if "garbage" not in models_cache:
-            if os.path.exists(GARBAGE_PATH):
-                models_cache["garbage"] = YOLO(GARBAGE_PATH)
-                sys.stderr.write(f"Worker: Loaded garbage model from {GARBAGE_PATH}\n")
-        return models_cache.get("garbage")
+    if current_loaded_type == model_type and current_model is not None:
+        return current_model
+
+    # Eject previous model to keep memory well under 220MB
+    if current_model is not None:
+        try:
+            del current_model
+        except Exception:
+            pass
+        current_model = None
+        current_loaded_type = None
+        gc.collect()
+
+    path = POTHOLE_PATH if model_type == "pothole" else GARBAGE_PATH
+    if os.path.exists(path):
+        current_model = YOLO(path)
+        current_loaded_type = model_type
+        sys.stderr.write(f"Worker: Loaded {model_type} model from {path}\n")
+        return current_model
     return None
 
 # Signal instantly to Node.js that the worker process is online (no heavy memory load at boot)
@@ -62,7 +71,9 @@ def run_model_inference(model, img, conf_threshold, target_label):
     if model is None:
         return [], 0.0
     w, h = img.size
-    results = model.predict(source=img, imgsz=640, conf=conf_threshold, verbose=False)
+    import torch
+    with torch.inference_mode():
+        results = model.predict(source=img, imgsz=480, conf=conf_threshold, verbose=False)
     dets = []
     if len(results) > 0 and results[0].boxes is not None:
         for box in results[0].boxes:
@@ -102,7 +113,7 @@ while True:
         req_id = req.get("id")
         img_path = req.get("imagePath")
         model_type = req.get("modelType", "both")
-        conf = float(req.get("conf", 0.25))
+        conf = float(req.get("conf", 0.20))
 
         if not img_path or not os.path.exists(img_path):
             res = {"id": req_id, "success": False, "error": f"Image file not found: {img_path}"}
@@ -121,7 +132,10 @@ while True:
             if p_model:
                 pothole_dets, pothole_max_conf = run_model_inference(p_model, img, conf, "Pothole")
 
-        if model_type in ["garbage", "both"]:
+        # When running both: if pothole confirmed with high confidence, skip loading garbage model to save RAM
+        skip_garbage = (model_type == "both" and pothole_max_conf >= conf and len(pothole_dets) > 0)
+
+        if model_type in ["garbage", "both"] and not skip_garbage:
             g_model = get_yolo_model("garbage")
             if g_model:
                 garbage_dets, garbage_max_conf = run_model_inference(g_model, img, conf, "Garbage accumulation")

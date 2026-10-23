@@ -13,8 +13,8 @@ export const INFERENCE_CONFIG = {
   garbageModelPath: process.env.GARBAGE_MODEL_PATH || path.resolve(__dirname, "../models/garbage_best.pt"),
   
   // Detection Confidence Thresholds
-  potholeConfidenceThreshold: parseFloat(process.env.POTHOLE_CONFIDENCE_THRESHOLD || "0.20"),
-  garbageConfidenceThreshold: parseFloat(process.env.GARBAGE_CONFIDENCE_THRESHOLD || "0.20"),
+  potholeConfidenceThreshold: parseFloat(process.env.POTHOLE_CONFIDENCE_THRESHOLD || "0.18"),
+  garbageConfidenceThreshold: parseFloat(process.env.GARBAGE_CONFIDENCE_THRESHOLD || "0.18"),
   
   // High confidence threshold for automatic acceptance without Gemini
   highConfidenceThreshold: 0.35,
