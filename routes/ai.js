@@ -1,17 +1,32 @@
 import express from "express";
+import multer from "multer";
+import fs from "fs";
+import { fileURLToPath } from "url";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import fetch from "node-fetch";
-import Complaint from "../models/Complaint.js";
 import { supportedLanguages } from "../data/authorityData.js";
+import { INFERENCE_CONFIG } from "../config/inferenceConfig.js";
+import {
+  runYoloInference,
+  checkYoloServiceHealth,
+  checkLocalModelsAvailable,
+} from "../utils/yoloInference.js";
+import {
+  generateDeterministicLetter,
+  getTemplateType,
+  TEMPLATE_TYPES,
+} from "../utils/complaintTemplates.js";
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const router = express.Router();
+const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
 
-// Google Gemini client
+// ===================================================
+// GOOGLE GEMINI CLIENT CONFIGURATION
+// ===================================================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Safety settings shared by all models
 const safetySettings = [
   { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
   { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -19,20 +34,18 @@ const safetySettings = [
   { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
 ];
 
-// Model configuration for JSON outputs (analyze, validate-category)
 const jsonModelConfig = {
-  model: "gemini-2.5-flash",
+  model: process.env.GEMINI_MODEL || "gemini-1.5-flash",
   generationConfig: {
-    temperature: 0.2,
+    temperature: 0.1,
     maxOutputTokens: 2048,
     responseMimeType: "application/json",
   },
   safetySettings,
 };
 
-// Model configuration for plain text outputs (translation)
 const textModelConfig = {
-  model: "gemini-2.5-flash",
+  model: process.env.GEMINI_MODEL || "gemini-1.5-flash",
   generationConfig: {
     temperature: 0.2,
     maxOutputTokens: 4096,
@@ -40,326 +53,933 @@ const textModelConfig = {
   safetySettings,
 };
 
-let visionModel, textModel, translationModel;
+let visionModel, translationModel;
 try {
   visionModel = genAI.getGenerativeModel(jsonModelConfig);
-  textModel = genAI.getGenerativeModel(jsonModelConfig);
   translationModel = genAI.getGenerativeModel(textModelConfig);
-  console.log("✅ Gemini models initialized (JSON + Text)");
+  console.log("✅ Gemini models initialized (JSON Vision + Text Translation)");
 } catch (err) {
   console.error("❌ Failed to initialize Gemini models:", err.message);
 }
 
-// ===================================================
-// INVALID IMAGE DETECTION — List of non-civic items
-// ===================================================
-const INVALID_IMAGE_KEYWORDS = [
-  "selfie", "person posing", "food", "meal", "restaurant", "table", "laptop",
-  "computer", "phone", "mobile", "screenshot", "meme", "cartoon", "anime",
-  "pet", "cat", "dog", "nature scenery", "sunset", "beach", "mountain",
-  "indoor furniture", "bedroom", "living room", "bathroom mirror", "gym",
-  "shopping", "mall", "clothes", "shoes", "makeup", "jewelry", "car interior",
-  "dashboard", "video game", "social media", "wedding", "party", "birthday",
-  "certificate", "document scan", "book page", "random object", "toy",
-  "painting", "artwork", "abstract art"
-];
-
-const VALID_CIVIC_KEYWORDS = [
-  "pothole", "broken road", "cracked pavement", "garbage", "waste", "trash",
-  "litter", "debris", "streetlight", "broken light", "fallen pole", "drainage",
-  "sewer", "blocked drain", "overflowing", "water logging", "flooding",
-  "broken bench", "damaged wall", "graffiti", "broken sidewalk", "construction debris",
-  "open manhole", "damaged railing", "fallen tree", "broken pipe", "water leak",
-  "electricity pole damage", "signal broken", "traffic sign damage", "road damage",
-  "cracked building", "public toilet", "dirty public space"
-];
-
-// ===================================================
-// ANALYZE ENDPOINT — Vision-based civic issue detection + Image Validation
-// ===================================================
-router.post("/analyze", async (req, res) => {
-  try {
-    const { imageUrl, userName, locationAddress, authorityInfo } = req.body;
-
-    if (!imageUrl) {
-      return res.status(400).json({ message: "Image URL required" });
-    }
-
-    // Fallback if AI model not initialized
-    if (!visionModel) {
-      console.log("⚠️ AI model not available, returning fallback response");
-      return res.json({
-        problemType: "other",
-        severity: "Medium",
-        confidence: 50,
-        description: "AI analysis temporarily unavailable. Please verify the issue details manually.",
-        imageValidation: { isValid: true, reason: "AI unavailable — skipped validation", detectedContent: "unknown" },
-        formalLetter: `To,\nThe Municipal Commissioner,\nMunicipal Corporation\n\nSubject: Complaint regarding civic issue\n\nRespected Sir/Madam,\n\nI am writing to bring to your attention a civic issue that requires immediate attention. Please review the attached image and details.\n\nThank you for your prompt action.\n\nYours faithfully,\n${userName || "Anonymous Citizen"}`
-      });
-    }
-
-    // Build dynamic prompt inserts
-    const nameInsert = userName
-      ? `The complainant's name is "${userName}".`
-      : "";
-    const locationInsert = locationAddress
-      ? `The location of the issue is "${locationAddress}".`
-      : "";
-
-    const promptText = `You are a civic issue detection AI with IMAGE VALIDATION capabilities. 
-
-**STEP 1 — IMAGE VALIDATION:**
-First, determine if this image shows a REAL civic/infrastructure issue or something unrelated.
-
-INVALID images (NOT civic issues) include:
-- Selfies, people posing, group photos
-- Food, meals, restaurants
-- Laptops, phones, computers, screenshots
-- Pets, animals, nature scenery
-- Indoor furniture, bedrooms, bathrooms
-- Shopping, clothes, personal items
-- Memes, cartoons, artwork
-- Random objects, toys, documents
-- Cars (interior), video games
-
-VALID civic issue images include:
-- Potholes, broken roads, cracked pavements
-- Garbage, waste, trash, litter, debris
-- Broken/damaged streetlights, fallen poles
-- Blocked drains, sewers, water logging
-- Open manholes, broken pipes, water leaks
-- Damaged public infrastructure (benches, walls, railings, sidewalks)
-- Fallen trees on roads, construction debris
-- Damaged traffic signals/signs
-
-**STEP 2 — If VALID, analyze the issue:**
-
-Issue Types (pick closest):
-- "pothole" = visible holes, cracks, or damage in a road or pavement surface
-- "garbage" = uncollected waste, trash piles, litter, debris in public spaces
-- "streetlight" = broken, damaged, fallen, or non-functional street light poles
-- "drainage" = blocked, overflowing, or damaged drains/sewers
-- "other" = any other civic infrastructure issue
-- "None" = the image does NOT show any civic issue
-
-CONFIDENCE GUIDELINES (0 to 100):
-- 85-100: Issue clearly visible
-- 70-84: Visible but less clear
-- 50-69: Ambiguous
-- Below 50: Likely not a real issue
-
-${nameInsert}
-${locationInsert}
-
-IMPORTANT: For the 'complaintBody' field, write ONLY the main paragraphs of the formal complaint letter describing the issue. 
-- Start directly with the issue description (e.g., "I wish to bring to your urgent attention...").
-- Do NOT include the Date, To address, Subject, Salutation (Dear Sir/Madam), or Closing (Yours faithfully), as these will be added automatically.
-- Mention the location and the problem clearly based on the image.
-
-Return ONLY valid JSON (no markdown, no backticks):
-{
-  "imageValidation": {
-    "isValid": true/false,
-    "reason": "<why valid or invalid>",
-    "detectedContent": "<what you see in the image>"
-  },
-  "problemType": "<type or None if invalid>",
-  "severity": "<low|medium|high>",
-  "confidence": <0-100>,
-  "description": "<2-3 line description>",
-  "complaintBody": "<2-3 paragraphs describing the issue in formal language, mentioning the location if provided>"
+/**
+ * Downloads image from URL and converts to base64 buffer for Gemini
+ */
+async function fetchImageBase64(imageUrl) {
+  if (imageUrl.startsWith("file://") || fs.existsSync(imageUrl)) {
+    const filePath = imageUrl.startsWith("file://") ? fileURLToPath(imageUrl) : imageUrl;
+    const buffer = await fs.promises.readFile(filePath);
+    return {
+      base64Image: buffer.toString("base64"),
+      mimeType: "image/jpeg",
+    };
+  }
+  const imgResponse = await fetch(imageUrl);
+  if (!imgResponse.ok) {
+    throw new Error(`Failed to fetch image: ${imgResponse.statusText}`);
+  }
+  const arrayBuffer = await imgResponse.arrayBuffer();
+  const base64Image = Buffer.from(arrayBuffer).toString("base64");
+  const mimeType = imgResponse.headers.get("content-type") || "image/jpeg";
+  return { base64Image, mimeType };
 }
 
-CRITICAL: If the image is INVALID, set imageValidation.isValid = false and set problemType = "None", confidence = 0, complaintBody = "".
-CRITICAL: The output MUST be strictly valid JSON. You MUST escape all newlines inside strings using \\n.
-`;
+/**
+ * Safe caller for Gemini Vision with exponential backoff on 429/quota
+ */
+async function callGeminiVision(base64Image, mimeType, promptText) {
+  if (!visionModel) {
+    throw new Error("Gemini Vision model is not initialized.");
+  }
 
-    // Download image and convert to base64 for Gemini vision
-    const imgResponse = await fetch(imageUrl);
-    const arrayBuffer = await imgResponse.arrayBuffer();
-    const base64Image = Buffer.from(arrayBuffer).toString("base64");
-    const mimeType = imgResponse.headers.get("content-type") || "image/jpeg";
-
-    let rawText;
-    let lastError;
-    
-    for (let i = 0; i < 3; i++) {
-      try {
-        console.log(`Attempt ${i + 1}/3: Calling Gemini API...`);
-        
-        const result = await visionModel.generateContent({
-          contents: [{
+  let lastError;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const result = await visionModel.generateContent({
+        contents: [
+          {
             role: "user",
             parts: [
               {
                 inlineData: {
                   mimeType: mimeType,
-                  data: base64Image
-                }
+                  data: base64Image,
+                },
               },
               {
-                text: promptText
-              }
-            ]
-          }]
-        });
-        
-        const response = await result.response;
-        rawText = response.text();
-        console.log("✅ Gemini API Success");
-        break; // Success
-      } catch (err) {
-        lastError = err;
-        const msg = err.message || "";
-        console.error(`❌ Attempt ${i + 1} failed:`, msg);
-        
-        // Check for rate limit, quota exceeded, or access denied
-        const isQuotaError = msg.includes("429") || msg.includes("quota") || msg.includes("rate") || msg.includes("Please retry");
-        const isAccessDenied = msg.includes("403") || msg.includes("Forbidden") || msg.includes("denied access") || msg.includes("PERMISSION_DENIED");
-        
-        if ((isQuotaError || isAccessDenied) && i < 2) {
-          const delay = Math.pow(2, i) * 3000; // Exponential backoff: 3s, 6s, 12s
-          console.log(`⏳ Rate limited / access denied. Waiting ${delay}ms before retry...`);
-          await sleep(delay);
-        } else if (msg.includes("safety") || msg.includes("blocked")) {
-          // Safety block - return fallback immediately
-          console.log("⚠️ Content blocked by safety settings");
-          return res.json({
-            problemType: "other",
-            severity: "Medium",
-            description: "AI analysis blocked. Please describe the issue manually.",
-            formalLetter: "AI analysis blocked by safety settings. Please describe the issue manually.",
-            confidence: 0.5,
-            priority: 20,
-            imageValidation: { isValid: true, reason: "Safety blocked — skipped", detectedContent: "unknown" },
-          });
-        } else if (isQuotaError || isAccessDenied) {
-          // Final retry exhausted for quota/access errors — don't throw, let it fall through to fallback
-          console.log(`⚠️ All retries exhausted for quota/access error`);
-        } else {
-          throw err;
-        }
-      }
-    }
-    
-    if (!rawText) {
-      throw lastError || new Error("Failed to get response from Gemini API");
-    }
+                text: promptText,
+              },
+            ],
+          },
+        ],
+      });
 
-
-    // Clean markdown fences
-    const cleaned = rawText
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
-
-    // Extract JSON block
-    const jsonStart = cleaned.indexOf("{");
-    const jsonEnd = cleaned.lastIndexOf("}") + 1;
-    const jsonString = cleaned.substring(jsonStart, jsonEnd);
-
-    let parsed;
-    try {
-      parsed = JSON.parse(jsonString);
-
-      parsed.confidence = Number(parsed.confidence);
-
-      // Normalize confidence: AI returns 0-100, frontend expects 0-1
-      if (!parsed.confidence || isNaN(parsed.confidence)) {
-        // Fallback confidence based on severity
-        if (parsed.severity === "high") parsed.confidence = 0.9;
-        else if (parsed.severity === "medium") parsed.confidence = 0.8;
-        else if (parsed.severity === "low") parsed.confidence = 0.7;
-        else parsed.confidence = 0.5;
-      } else if (parsed.confidence > 1) {
-        // Convert 0-100 to 0-1
-        parsed.confidence = parsed.confidence / 100;
-      }
+      const response = await result.response;
+      const rawText = response.text();
+      const cleaned = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
+      const jsonStart = cleaned.indexOf("{");
+      const jsonEnd = cleaned.lastIndexOf("}") + 1;
+      return JSON.parse(cleaned.substring(jsonStart, jsonEnd));
     } catch (err) {
-      console.log("JSON parse error:", err.message);
-      return res.json({ raw: cleaned, error: "JSON Parse Error: " + err.message });
+      lastError = err;
+      const msg = err.message || "";
+      const isQuotaError =
+        msg.includes("429") ||
+        msg.includes("quota") ||
+        msg.includes("rate") ||
+        msg.includes("Please retry");
+      const isAccessDenied =
+        msg.includes("403") ||
+        msg.includes("Forbidden") ||
+        msg.includes("denied access") ||
+        msg.includes("PERMISSION_DENIED");
+
+      if ((isQuotaError || isAccessDenied) && i < 2) {
+        const delay = Math.pow(2, i) * 3000;
+        console.log(`⏳ Gemini rate limited. Waiting ${delay}ms before retry...`);
+        await sleep(delay);
+      } else {
+        throw err;
+      }
     }
+  }
+  throw lastError || new Error("Failed to receive valid response from Gemini.");
+}
 
-    // Extract image validation result
-    const imageValidation = parsed.imageValidation || { isValid: true, reason: "", detectedContent: "" };
+/**
+ * Helper to normalize problem type to match Android / Web schemas
+ */
+function normalizeProblemType(rawType) {
+  if (!rawType || rawType === "None") return "Other";
+  const t = rawType.toLowerCase();
+  if (t.includes("pothole") || t.includes("road")) return "Pothole";
+  if (t.includes("garbage") || t.includes("waste")) return "Garbage Dump";
+  if (t.includes("light") || t.includes("streetlight")) return "Streetlight Fault";
+  if (t.includes("drain") || t.includes("flood") || t.includes("sewer")) return "Broken Drainage";
+  if (t.includes("water")) return "Water Leakage";
+  if (t.includes("tree")) return "Fallen Tree";
+  return "Other";
+}
 
-    // Priority calculation
-    let severityScore = 0;
-    if (parsed.severity === "high") severityScore = 3;
-    if (parsed.severity === "medium") severityScore = 2;
-    if (parsed.severity === "low") severityScore = 1;
+/**
+ * Deterministic severity calculator for YOLO detections
+ */
+function calculateYoloSeverity(detectionCount, maxConfidence) {
+  if (detectionCount >= 3 || maxConfidence >= 0.65) return "High";
+  if (detectionCount >= 2 || maxConfidence >= 0.38) return "Medium";
+  return "Low";
+}
 
-    const priority = severityScore * 10;
+// ===================================================
+// SYSTEM STATUS ENDPOINT
+// ===================================================
+router.get("/status", async (req, res) => {
+  try {
+    const localModels = checkLocalModelsAvailable();
+    const serviceHealth = await checkYoloServiceHealth();
 
-    // --- Assemble final formal letter ensuring correct date and city ---
-    let finalLetter = "";
-    if (parsed.problemType !== "None" && parsed.problemType) {
-      const todayDate = new Date().toLocaleDateString('en-IN', { year: 'numeric', month: 'long', day: 'numeric' });
-      
-      const header = authorityInfo?.letterHeader || "To,\nThe Local Authority,\nConcerned Department";
-      
-      let subjectLocation = locationAddress ? ` at ${locationAddress.split(',')[0]}` : '';
-      const subject = `Subject: Urgent complaint regarding ${parsed.problemType} issue${subjectLocation}`;
-      
-      const salutation = "Respected Sir/Madam,";
-      
-      let bodyText = parsed.complaintBody || parsed.formalLetter || `I am writing to report a ${parsed.problemType} issue${locationAddress ? ` located at ${locationAddress}` : ''}. Please look into this matter urgently as it is causing inconvenience to the public.`;
-      
-      // Clean up body text in case the AI still included salutations or closing
-      bodyText = bodyText.replace(/Subject:.*\n/gi, '');
-      bodyText = bodyText.replace(/(Dear|Respected) (Sir|Madam)[,\.]?\n/gi, '');
-      bodyText = bodyText.replace(/Yours (faithfully|sincerely|truly)[,\.]?\n.*/gis, '');
-      bodyText = bodyText.replace(/Date:.*\n/gi, '');
-      bodyText = bodyText.replace(/To,\n.*\n/gi, ''); // Try to strip "To," block if any
-      bodyText = bodyText.replace(/\\n/g, '\n'); // Fix literal \n
-      bodyText = bodyText.trim();
-
-      const closing = `Thank you for your prompt action.\n\nYours faithfully,\n${userName || "Concerned Citizen"}`;
-      
-      finalLetter = `Date: ${todayDate}\n\n${header}\n\n${subject}\n\n${salutation}\n\n${bodyText}\n\n${closing}`;
-    }
-
-    const previewData = {
-      imageUrl,
-      problemType: parsed.problemType,
-      severity:
-        parsed.severity === "low"
-          ? "Low"
-          : parsed.severity === "high"
-          ? "High"
-          : "Medium",
-      description: parsed.description,
-      formalLetter: finalLetter,
-      priority,
-      confidence: parsed.confidence,
-      imageValidation,
-    };
-
-    res.json(previewData);
+    res.json({
+      status: "online",
+      architecture: "YOLO-First with Gemini Vision Fallback",
+      yoloModels: {
+        pothole_best: {
+          available: localModels.pothole,
+          threshold: INFERENCE_CONFIG.potholeConfidenceThreshold,
+        },
+        garbage_best: {
+          available: localModels.garbage,
+          threshold: INFERENCE_CONFIG.garbageConfidenceThreshold,
+        },
+      },
+      inferenceService: {
+        httpServiceActive: serviceHealth.online,
+        cliFallbackReady: true,
+      },
+      geminiVision: {
+        ready: !!visionModel,
+        primaryFor: ["streetlight"],
+        fallbackFor: ["pothole", "garbage", "unidentified"],
+      },
+      translation: {
+        ready: !!translationModel,
+        languagesCount: supportedLanguages.length,
+      },
+    });
   } catch (error) {
-    console.error("Gemini AI Error:", error.message);
-    
-    // Build a proper fallback letter so the UI still shows something useful
-    const userName = req.body.userName || "Concerned Citizen";
-    const locationAddress = req.body.locationAddress || "";
-    const todayDate = new Date().toLocaleDateString('en-IN', { year: 'numeric', month: 'long', day: 'numeric' });
-    const aInfo = req.body.authorityInfo;
-    const header = aInfo?.letterHeader || "To,\nThe Local Authority,\nConcerned Department";
-    const fallbackLetter = `Date: ${todayDate}\n\n${header}\n\nSubject: Complaint regarding civic issue${locationAddress ? ` at ${locationAddress.split(',')[0]}` : ''}\n\nRespected Sir/Madam,\n\nI am writing to bring to your attention a civic issue that requires immediate attention${locationAddress ? ` at ${locationAddress}` : ''}. The attached photograph provides evidence of the problem. I kindly request that appropriate action be taken at the earliest to resolve this matter, as it is causing inconvenience to residents in the area.\n\nThank you for your prompt action.\n\nYours faithfully,\n${userName}`;
-    
-    return res.json({
-      problemType: "other",
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+// ===================================================
+// MAIN ANALYZE ENDPOINT (YOLO-FIRST + GEMINI FALLBACK)
+// ===================================================
+router.post("/analyze", async (req, res) => {
+  try {
+    const {
+      imageUrl,
+      userName = "Concerned Citizen",
+      locationAddress = "",
+      authorityInfo = null,
+      category = "",
+      problemType = "",
+    } = req.body;
+
+    if (!imageUrl) {
+      return res.status(400).json({ message: "Image URL required" });
+    }
+
+    const selectedCategory = (category || "").toLowerCase();
+    const selectedProblemType = (problemType || "").toLowerCase();
+
+    const isRoadDamage =
+      selectedCategory.includes("pothole") ||
+      selectedCategory.includes("road") ||
+      selectedProblemType.includes("pothole");
+
+    const isGarbage =
+      selectedCategory.includes("garbage") ||
+      selectedCategory.includes("waste") ||
+      selectedProblemType.includes("garbage");
+
+    const isStreetlight =
+      selectedCategory.includes("street light") ||
+      selectedCategory.includes("streetlight") ||
+      selectedCategory.includes("light") ||
+      selectedCategory.includes("electricity") ||
+      selectedProblemType.includes("streetlight") ||
+      selectedProblemType.includes("light");
+
+    // ==============================================================
+    // ROUTE 1: ROAD DAMAGE / POTHOLE (YOLO11n pothole_best.pt First)
+    // ==============================================================
+    if (isRoadDamage) {
+      console.log("🛣️ Routing image to local YOLO model: pothole_best.pt");
+      const yoloResult = await runYoloInference({
+        imageUrl,
+        modelType: "pothole",
+        confidenceThreshold: INFERENCE_CONFIG.potholeConfidenceThreshold,
+      });
+
+      const isConfidentYolo =
+        yoloResult.success &&
+        yoloResult.detectionCount > 0 &&
+        yoloResult.maxConfidence >= INFERENCE_CONFIG.potholeConfidenceThreshold;
+
+      if (isConfidentYolo) {
+        console.log(
+          `✅ YOLO pothole detection confirmed (${yoloResult.detectionCount} detections, max conf: ${yoloResult.maxConfidence}). Skipping Gemini.`
+        );
+
+        const severity = calculateYoloSeverity(yoloResult.detectionCount, yoloResult.maxConfidence);
+        const resolvedType = "Pothole";
+
+        // Deterministic Letter Generation (Section 8)
+        const formalLetter = generateDeterministicLetter({
+          templateType: TEMPLATE_TYPES.ROAD_DAMAGE,
+          userName,
+          locationAddress,
+          authorityInfo,
+          problemType: resolvedType,
+          detectionCount: yoloResult.detectionCount,
+          severity,
+        });
+
+        return res.json({
+          success: true,
+          imageUrl,
+          problemType: resolvedType,
+          severity,
+          confidence: yoloResult.maxConfidence,
+          description: `Verified road surface deterioration with ${yoloResult.detectionCount} prominent pothole depression(s) detected.`,
+          formalLetter,
+          priority: severity === "High" ? 30 : severity === "Medium" ? 20 : 10,
+          analysisProvider: "yolo",
+          geminiFallback: false,
+          model: "pothole_best",
+          detectionCount: yoloResult.detectionCount,
+          detections: yoloResult.detections,
+          imageValidation: {
+            isValid: true,
+            reason: `Local YOLO scan confirmed road damage with ${yoloResult.detectionCount} detection(s).`,
+            detectedContent: "pothole / asphalt damage",
+          },
+          canReportManually: true,
+        });
+      }
+
+      // Fallback to Gemini Vision if YOLO was uncertain, empty, or failed
+      const fallbackReason = !yoloResult.success
+        ? "model_unavailable"
+        : yoloResult.detectionCount === 0
+        ? "no_detections"
+        : "low_confidence";
+
+      console.log(`⚠️ YOLO pothole scan uncertain (${fallbackReason}). Invoking Gemini Vision fallback...`);
+      return await handleGeminiCivicFallback({
+        imageUrl,
+        userName,
+        locationAddress,
+        authorityInfo,
+        fallbackReason,
+        expectedCategory: "pothole",
+        res,
+      });
+    }
+
+    // ==============================================================
+    // ROUTE 2: GARBAGE / WASTE (YOLO11n garbage_best.pt First)
+    // ==============================================================
+    if (isGarbage) {
+      console.log("🗑️ Routing image to local YOLO model: garbage_best.pt");
+      const yoloResult = await runYoloInference({
+        imageUrl,
+        modelType: "garbage",
+        confidenceThreshold: INFERENCE_CONFIG.garbageConfidenceThreshold,
+      });
+
+      const isConfidentYolo =
+        yoloResult.success &&
+        yoloResult.detectionCount > 0 &&
+        yoloResult.maxConfidence >= INFERENCE_CONFIG.garbageConfidenceThreshold;
+
+      if (isConfidentYolo) {
+        console.log(
+          `✅ YOLO garbage detection confirmed (${yoloResult.detectionCount} detections, max conf: ${yoloResult.maxConfidence}). Skipping Gemini.`
+        );
+
+        const severity = calculateYoloSeverity(yoloResult.detectionCount, yoloResult.maxConfidence);
+        const resolvedType = "Garbage Dump";
+
+        // Deterministic Letter Generation (Section 8)
+        const formalLetter = generateDeterministicLetter({
+          templateType: TEMPLATE_TYPES.GARBAGE,
+          userName,
+          locationAddress,
+          authorityInfo,
+          problemType: resolvedType,
+          detectionCount: yoloResult.detectionCount,
+          severity,
+        });
+
+        return res.json({
+          success: true,
+          imageUrl,
+          problemType: resolvedType,
+          severity,
+          confidence: yoloResult.maxConfidence,
+          description: `Verified solid waste accumulation with ${yoloResult.detectionCount} dump cluster(s) detected.`,
+          formalLetter,
+          priority: severity === "High" ? 30 : severity === "Medium" ? 20 : 10,
+          analysisProvider: "yolo",
+          geminiFallback: false,
+          model: "garbage_best",
+          detectionCount: yoloResult.detectionCount,
+          detections: yoloResult.detections,
+          imageValidation: {
+            isValid: true,
+            reason: `Local YOLO scan confirmed garbage accumulation with ${yoloResult.detectionCount} detection(s).`,
+            detectedContent: "solid waste / garbage accumulation",
+          },
+          canReportManually: true,
+        });
+      }
+
+      const fallbackReason = !yoloResult.success
+        ? "model_unavailable"
+        : yoloResult.detectionCount === 0
+        ? "no_detections"
+        : "low_confidence";
+
+      console.log(`⚠️ YOLO garbage scan uncertain (${fallbackReason}). Invoking Gemini Vision fallback...`);
+      return await handleGeminiCivicFallback({
+        imageUrl,
+        userName,
+        locationAddress,
+        authorityInfo,
+        fallbackReason,
+        expectedCategory: "garbage",
+        res,
+      });
+    }
+
+    // ==============================================================
+    // ROUTE 3: STREETLIGHT (Gemini Vision Primary Service)
+    // ==============================================================
+    if (isStreetlight) {
+      console.log("💡 Routing image to Gemini Vision Primary Service for Streetlight Inspection");
+      return await handleStreetlightGeminiPrimary({
+        imageUrl,
+        userName,
+        locationAddress,
+        authorityInfo,
+        res,
+      });
+    }
+
+    // ==============================================================
+    // ROUTE 4: UNSELECTED / UNIDENTIFIED CATEGORY
+    // ==============================================================
+    console.log("🔍 Category unselected. Running both local YOLO models first...");
+    const multiYolo = await runYoloInference({
+      imageUrl,
+      modelType: "both",
+      confidenceThreshold: Math.min(
+        INFERENCE_CONFIG.potholeConfidenceThreshold,
+        INFERENCE_CONFIG.garbageConfidenceThreshold
+      ),
+    });
+
+    // Check if either local model produced a confident hit
+    const potholeHits = multiYolo.allDetections?.pothole || [];
+    const garbageHits = multiYolo.allDetections?.garbage || [];
+
+    const bestPotholeConf = potholeHits.length > 0 ? potholeHits[0].confidence : 0;
+    const bestGarbageConf = garbageHits.length > 0 ? garbageHits[0].confidence : 0;
+
+    if (
+      bestPotholeConf >= INFERENCE_CONFIG.potholeConfidenceThreshold &&
+      bestPotholeConf >= bestGarbageConf
+    ) {
+      console.log(`✅ Unselected category classified as Road Damage via YOLO (conf: ${bestPotholeConf})`);
+      const severity = calculateYoloSeverity(potholeHits.length, bestPotholeConf);
+      const formalLetter = generateDeterministicLetter({
+        templateType: TEMPLATE_TYPES.ROAD_DAMAGE,
+        userName,
+        locationAddress,
+        authorityInfo,
+        problemType: "Pothole",
+        detectionCount: potholeHits.length,
+        severity,
+      });
+
+      return res.json({
+        success: true,
+        imageUrl,
+        problemType: "Pothole",
+        severity,
+        confidence: bestPotholeConf,
+        description: `Automated scan identified road damage with ${potholeHits.length} pothole(s).`,
+        formalLetter,
+        priority: severity === "High" ? 30 : 20,
+        analysisProvider: "yolo",
+        geminiFallback: false,
+        model: "pothole_best",
+        detectionCount: potholeHits.length,
+        detections: potholeHits,
+        imageValidation: {
+          isValid: true,
+          reason: "Classified as road damage by local YOLO detector.",
+          detectedContent: "pothole",
+        },
+        canReportManually: true,
+      });
+    }
+
+    if (bestGarbageConf >= INFERENCE_CONFIG.garbageConfidenceThreshold) {
+      console.log(`✅ Unselected category classified as Garbage Dump via YOLO (conf: ${bestGarbageConf})`);
+      const severity = calculateYoloSeverity(garbageHits.length, bestGarbageConf);
+      const formalLetter = generateDeterministicLetter({
+        templateType: TEMPLATE_TYPES.GARBAGE,
+        userName,
+        locationAddress,
+        authorityInfo,
+        problemType: "Garbage Dump",
+        detectionCount: garbageHits.length,
+        severity,
+      });
+
+      return res.json({
+        success: true,
+        imageUrl,
+        problemType: "Garbage Dump",
+        severity,
+        confidence: bestGarbageConf,
+        description: `Automated scan identified uncollected solid waste accumulation with ${garbageHits.length} dump site(s).`,
+        formalLetter,
+        priority: severity === "High" ? 30 : 20,
+        analysisProvider: "yolo",
+        geminiFallback: false,
+        model: "garbage_best",
+        detectionCount: garbageHits.length,
+        detections: garbageHits,
+        imageValidation: {
+          isValid: true,
+          reason: "Classified as garbage accumulation by local YOLO detector.",
+          detectedContent: "garbage dump",
+        },
+        canReportManually: true,
+      });
+    }
+
+    // Neither local model yielded a confident match -> Gemini fallback to identify issue or reject
+    console.log("⚠️ No local model matches. Invoking Gemini Vision to identify civic issue or reject...");
+    return await handleGeminiCivicFallback({
+      imageUrl,
+      userName,
+      locationAddress,
+      authorityInfo,
+      fallbackReason: "category_classification",
+      expectedCategory: null,
+      res,
+    });
+  } catch (error) {
+    console.error("General AI Analyze Error:", error.message);
+    const fallbackLetter = generateDeterministicLetter({
+      templateType: TEMPLATE_TYPES.GENERAL,
+      userName: req.body?.userName || "Concerned Citizen",
+      locationAddress: req.body?.locationAddress || "",
+      authorityInfo: req.body?.authorityInfo,
+      problemType: "Civic Infrastructure Defect",
       severity: "Medium",
-      description: "AI analysis temporarily unavailable. Please verify the issue details manually.",
+    });
+
+    return res.json({
+      problemType: "Other",
+      severity: "Medium",
+      description: "AI analysis temporarily unavailable. Issue details have been initialized for manual verification.",
       formalLetter: fallbackLetter,
-      confidence: 0.65,
+      confidence: 0.6,
       priority: 20,
-      imageValidation: { isValid: true, reason: "AI error — skipped validation", detectedContent: "unknown" },
-      aiFallback: true,
+      analysisProvider: "gemini",
+      geminiFallback: true,
+      fallbackReason: "service_error",
+      imageValidation: {
+        isValid: true,
+        reason: "Analysis service error — manual reporting permitted",
+        detectedContent: "unknown",
+      },
+      canReportManually: true,
     });
   }
 });
 
+/**
+ * Streetlight Primary Analysis using Gemini Vision
+ * Enforces strict physical damage checks (broken fixture, bent pole, hanging wires)
+ * explicitly avoiding assuming an electrical fault solely because lamp is unlit in daytime.
+ */
+async function handleStreetlightGeminiPrimary({
+  imageUrl,
+  userName,
+  locationAddress,
+  authorityInfo,
+  res,
+}) {
+  try {
+    const { base64Image, mimeType } = await fetchImageBase64(imageUrl);
+
+    const promptText = `You are a professional municipal electrical & public works infrastructure inspector.
+Analyze this image of a public streetlight, lamp post, or lighting installation.
+
+CRITICAL PHYSICAL INSPECTION REQUIREMENTS:
+1. Assess VISIBLE PHYSICAL DAMAGE to the fixture:
+   - Broken, cracked, or shattered lamp glass/fixture
+   - Bent, tilted, fractured, or fallen poles
+   - Missing or detached lamp heads / luminaires
+   - Exposed, dangling, or severed electrical wiring
+   - Severe corrosion, rust, or vehicular collision impact at the pole base
+2. IMPORTANT ELECTRICAL CONSERVATISM RULE:
+   - Do NOT infer that a streetlight's electrical system is faulty solely because the lamp appears switched off during daytime or nighttime photos.
+   - If the lamp is unlit during daylight hours but has NO visible physical defects, note this explicitly.
+
+Return strictly valid JSON:
+{
+  "imageValidation": {
+    "isValid": true/false,
+    "reason": "<explanation of what is visible>",
+    "detectedContent": "<e.g. damaged streetlight pole, daytime unlit lamp, non-civic item>"
+  },
+  "physicalDamageDetected": true/false,
+  "detectedDefects": ["<defect 1>", "<defect 2>"],
+  "problemType": "Streetlight Fault" or "None",
+  "severity": "low" | "medium" | "high",
+  "confidence": <0 to 100>,
+  "description": "<detailed technical description of visible condition>",
+  "isDaytimeUnlitOnly": true/false
+}`;
+
+    const geminiData = await callGeminiVision(base64Image, mimeType, promptText);
+
+    // If image is unrelated to streetlights or civic issues
+    if (geminiData.imageValidation && !geminiData.imageValidation.isValid) {
+      return res.json({
+        imageUrl,
+        problemType: "None",
+        severity: "Low",
+        confidence: 0,
+        description: geminiData.description || "No visible streetlight damage detected.",
+        formalLetter: "",
+        priority: 0,
+        analysisProvider: "gemini",
+        geminiFallback: false,
+        imageValidation: geminiData.imageValidation,
+        canReportManually: true,
+      });
+    }
+
+    const normConfidence =
+      geminiData.confidence > 1 ? geminiData.confidence / 100 : geminiData.confidence || 0.8;
+    const severity =
+      geminiData.severity === "high" ? "High" : geminiData.severity === "low" ? "Low" : "Medium";
+    const detectedDefects = geminiData.detectedDefects || [];
+
+    // Deterministic Letter Generation (Section 8)
+    const formalLetter = generateDeterministicLetter({
+      templateType: TEMPLATE_TYPES.STREETLIGHT,
+      userName,
+      locationAddress,
+      authorityInfo,
+      problemType: "Streetlight Fault",
+      severity,
+      detectedDefects,
+    });
+
+    return res.json({
+      success: true,
+      imageUrl,
+      problemType: "Streetlight Fault",
+      severity,
+      confidence: normConfidence,
+      description:
+        geminiData.description ||
+        `Streetlight infrastructure defect reported with physical defects: ${
+          detectedDefects.join(", ") || "structural damage to luminaire"
+        }.`,
+      formalLetter,
+      priority: severity === "High" ? 30 : severity === "Medium" ? 20 : 10,
+      analysisProvider: "gemini",
+      geminiFallback: false,
+      detectedDefects,
+      physicalDamageDetected: geminiData.physicalDamageDetected ?? true,
+      isDaytimeUnlitOnly: geminiData.isDaytimeUnlitOnly ?? false,
+      imageValidation: geminiData.imageValidation || {
+        isValid: true,
+        reason: "Verified streetlight infrastructure",
+        detectedContent: "Streetlight fixture",
+      },
+      canReportManually: true,
+    });
+  } catch (error) {
+    console.error("Gemini Streetlight Analysis Error:", error.message);
+    const formalLetter = generateDeterministicLetter({
+      templateType: TEMPLATE_TYPES.STREETLIGHT,
+      userName,
+      locationAddress,
+      authorityInfo,
+      problemType: "Streetlight Fault",
+      severity: "Medium",
+    });
+
+    return res.json({
+      problemType: "Streetlight Fault",
+      severity: "Medium",
+      confidence: 0.7,
+      description: "Streetlight fault reported. Physical inspection recommended.",
+      formalLetter,
+      priority: 20,
+      analysisProvider: "gemini",
+      geminiFallback: false,
+      imageValidation: {
+        isValid: true,
+        reason: "Inspection initialised — manual verification enabled",
+        detectedContent: "Streetlight",
+      },
+      canReportManually: true,
+    });
+  }
+}
+
+/**
+ * General Civic Fallback Handler using Gemini Vision
+ * Triggered only when YOLO models fail, produce uncertain confidence, or for unselected categories.
+ */
+async function handleGeminiCivicFallback({
+  imageUrl,
+  userName,
+  locationAddress,
+  authorityInfo,
+  fallbackReason,
+  expectedCategory,
+  res,
+}) {
+  try {
+    const { base64Image, mimeType } = await fetchImageBase64(imageUrl);
+
+    const promptText = `You are a civic infrastructure inspection AI with IMAGE VALIDATION capabilities.
+
+Determine whether this image shows a real civic/infrastructure maintenance issue or is non-civic/unrelated.
+
+NON-CIVIC (INVALID) images:
+- Selfies, personal photos, group portraits
+- Food, dishes, restaurant settings
+- Laptops, computers, screens, documents, certificates
+- Pets, indoor domestic animals, houseplants
+- Memes, artwork, cartoons, digital graphics
+- Vehicle interiors, dashboard cameras showing clear road with no defects
+
+VALID CIVIC ISSUES (pick closest):
+- "pothole" = road damage, asphalt crater, broken pavement
+- "garbage" = solid waste accumulation, uncollected trash, dump pile
+- "streetlight" = damaged street light fixture, bent pole, exposed wiring
+- "drainage" = blocked drain, sewer leakage, waterlogging
+- "other" = any other civic infrastructure issue (damaged bench, public toilet, broken railing, fallen tree)
+- "None" = image is NOT a civic issue
+
+Return strictly valid JSON:
+{
+  "imageValidation": {
+    "isValid": true/false,
+    "reason": "<concise explanation>",
+    "detectedContent": "<what is visible in the photo>"
+  },
+  "problemType": "<pothole|garbage|streetlight|drainage|other|None>",
+  "severity": "low" | "medium" | "high",
+  "confidence": <0 to 100>,
+  "description": "<2-3 line objective description of the issue>"
+}`;
+
+    const geminiData = await callGeminiVision(base64Image, mimeType, promptText);
+
+    // Rejection handling if image is not a civic issue
+    if (geminiData.imageValidation && !geminiData.imageValidation.isValid) {
+      return res.json({
+        imageUrl,
+        problemType: "None",
+        severity: "Low",
+        confidence: 0,
+        description: "No recognized civic infrastructure defect identified in this photograph.",
+        formalLetter: "",
+        priority: 0,
+        analysisProvider: "gemini",
+        geminiFallback: true,
+        fallbackReason,
+        imageValidation: geminiData.imageValidation,
+        canReportManually: true,
+      });
+    }
+
+    const normType = normalizeProblemType(geminiData.problemType);
+    const templateType = getTemplateType(normType);
+    const severity =
+      geminiData.severity === "high" ? "High" : geminiData.severity === "low" ? "Low" : "Medium";
+    const confidence =
+      geminiData.confidence > 1 ? geminiData.confidence / 100 : geminiData.confidence || 0.75;
+
+    // Generate letter deterministically (Section 8)
+    const formalLetter = generateDeterministicLetter({
+      templateType,
+      userName,
+      locationAddress,
+      authorityInfo,
+      problemType: normType,
+      severity,
+    });
+
+    return res.json({
+      success: true,
+      imageUrl,
+      problemType: normType,
+      severity,
+      confidence,
+      description:
+        geminiData.description || `Reported ${normType} issue at ${locationAddress || "specified location"}.`,
+      formalLetter,
+      priority: severity === "High" ? 30 : severity === "Medium" ? 20 : 10,
+      analysisProvider: "gemini",
+      geminiFallback: true,
+      fallbackReason,
+      imageValidation: geminiData.imageValidation || {
+        isValid: true,
+        reason: "Verified via Gemini Vision fallback inspection.",
+        detectedContent: normType,
+      },
+      canReportManually: true,
+    });
+  } catch (error) {
+    console.error("Gemini Civic Fallback Error:", error.message);
+    const resolvedType = expectedCategory ? normalizeProblemType(expectedCategory) : "Other";
+    const formalLetter = generateDeterministicLetter({
+      templateType: getTemplateType(resolvedType),
+      userName,
+      locationAddress,
+      authorityInfo,
+      problemType: resolvedType,
+      severity: "Medium",
+    });
+
+    return res.json({
+      problemType: resolvedType,
+      severity: "Medium",
+      description: "AI analysis encountered an error. Issue template initialized for manual review.",
+      formalLetter,
+      confidence: 0.6,
+      priority: 20,
+      analysisProvider: "gemini",
+      geminiFallback: true,
+      fallbackReason: "service_error",
+      imageValidation: {
+        isValid: true,
+        reason: "Service error — manual reporting permitted",
+        detectedContent: "unknown",
+      },
+      canReportManually: true,
+    });
+  }
+}
+
+// ===================================================
+// DEDICATED ROAD DAMAGE DETECTION ENDPOINT
+// ===================================================
+router.post("/road-damage/detect", upload.single("image"), async (req, res) => {
+  try {
+    let imageUrl = req.body?.imageUrl;
+    let imageBuffer = req.file?.buffer;
+
+    if (!imageUrl && !imageBuffer) {
+      return res.status(400).json({ message: "Either image file or imageUrl is required." });
+    }
+
+    const confThreshold = req.body?.confidence
+      ? parseFloat(req.body.confidence)
+      : INFERENCE_CONFIG.potholeConfidenceThreshold;
+
+    const yoloRes = await runYoloInference({
+      imageUrl,
+      imageBuffer,
+      modelType: "pothole",
+      confidenceThreshold: confThreshold,
+    });
+
+    if (yoloRes.success && yoloRes.detectionCount > 0 && yoloRes.maxConfidence >= confThreshold) {
+      const severity = calculateYoloSeverity(yoloRes.detectionCount, yoloRes.maxConfidence);
+      const formalLetter = generateDeterministicLetter({
+        templateType: TEMPLATE_TYPES.ROAD_DAMAGE,
+        userName: req.body?.userName || "Concerned Citizen",
+        locationAddress: req.body?.locationAddress || "",
+        authorityInfo: req.body?.authorityInfo,
+        problemType: "Pothole",
+        detectionCount: yoloRes.detectionCount,
+        severity,
+      });
+
+      return res.json({
+        success: true,
+        problemType: "Pothole",
+        severity,
+        confidence: yoloRes.maxConfidence,
+        description: `Verified road surface deterioration with ${yoloRes.detectionCount} prominent pothole depression(s) detected.`,
+        formalLetter,
+        analysisProvider: "yolo",
+        geminiFallback: false,
+        model: "pothole_best",
+        detections: yoloRes.detections,
+        detectionCount: yoloRes.detectionCount,
+      });
+    }
+
+    // Fallback if low confidence or no detections
+    return await handleGeminiCivicFallback({
+      imageUrl: imageUrl || "data:image/jpeg;base64," + imageBuffer.toString("base64"),
+      userName: req.body?.userName,
+      locationAddress: req.body?.locationAddress,
+      authorityInfo: req.body?.authorityInfo,
+      fallbackReason: yoloRes.detectionCount === 0 ? "no_detections" : "low_confidence",
+      expectedCategory: "pothole",
+      res,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===================================================
+// DEDICATED GARBAGE DETECTION ENDPOINT
+// ===================================================
+router.post("/garbage/detect", upload.single("image"), async (req, res) => {
+  try {
+    let imageUrl = req.body?.imageUrl;
+    let imageBuffer = req.file?.buffer;
+
+    if (!imageUrl && !imageBuffer) {
+      return res.status(400).json({ message: "Either image file or imageUrl is required." });
+    }
+
+    const confThreshold = req.body?.confidence
+      ? parseFloat(req.body.confidence)
+      : INFERENCE_CONFIG.garbageConfidenceThreshold;
+
+    const yoloRes = await runYoloInference({
+      imageUrl,
+      imageBuffer,
+      modelType: "garbage",
+      confidenceThreshold: confThreshold,
+    });
+
+    if (yoloRes.success && yoloRes.detectionCount > 0 && yoloRes.maxConfidence >= confThreshold) {
+      const severity = calculateYoloSeverity(yoloRes.detectionCount, yoloRes.maxConfidence);
+      const formalLetter = generateDeterministicLetter({
+        templateType: TEMPLATE_TYPES.GARBAGE,
+        userName: req.body?.userName || "Concerned Citizen",
+        locationAddress: req.body?.locationAddress || "",
+        authorityInfo: req.body?.authorityInfo,
+        problemType: "Garbage Dump",
+        detectionCount: yoloRes.detectionCount,
+        severity,
+      });
+
+      return res.json({
+        success: true,
+        problemType: "Garbage Dump",
+        severity,
+        confidence: yoloRes.maxConfidence,
+        description: `Verified solid waste accumulation with ${yoloRes.detectionCount} dump cluster(s) detected.`,
+        formalLetter,
+        analysisProvider: "yolo",
+        geminiFallback: false,
+        model: "garbage_best",
+        detections: yoloRes.detections,
+        detectionCount: yoloRes.detectionCount,
+      });
+    }
+
+    // Fallback to Gemini
+    return await handleGeminiCivicFallback({
+      imageUrl: imageUrl || "data:image/jpeg;base64," + imageBuffer.toString("base64"),
+      userName: req.body?.userName,
+      locationAddress: req.body?.locationAddress,
+      authorityInfo: req.body?.authorityInfo,
+      fallbackReason: yoloRes.detectionCount === 0 ? "no_detections" : "low_confidence",
+      expectedCategory: "garbage",
+      res,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===================================================
+// DEDICATED STREETLIGHT DETECTION ENDPOINT
+// ===================================================
+router.post("/streetlight/detect", upload.single("image"), async (req, res) => {
+  try {
+    let imageUrl = req.body?.imageUrl;
+    let imageBuffer = req.file?.buffer;
+
+    if (!imageUrl && !imageBuffer) {
+      return res.status(400).json({ message: "Either image file or imageUrl is required." });
+    }
+
+    return await handleStreetlightGeminiPrimary({
+      imageUrl: imageUrl || "data:image/jpeg;base64," + imageBuffer.toString("base64"),
+      userName: req.body?.userName,
+      locationAddress: req.body?.locationAddress,
+      authorityInfo: req.body?.authorityInfo,
+      res,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ===================================================
 // CATEGORY MATCH ENDPOINT — Cross-validate image vs selected category
@@ -375,31 +995,15 @@ router.post("/validate-category", async (req, res) => {
       return res.json({ matches: true, confidence: 0, reason: "AI unavailable" });
     }
 
-    const imgResponse = await fetch(imageUrl);
-    const arrayBuffer = await imgResponse.arrayBuffer();
-    const base64Image = Buffer.from(arrayBuffer).toString("base64");
-    const mimeType = imgResponse.headers.get("content-type") || "image/jpeg";
+    const { base64Image, mimeType } = await fetchImageBase64(imageUrl);
 
     const prompt = `You are a verification AI. The user selected "${selectedCategory}" as the complaint category.
 Look at this image and determine if it matches the selected category.
 
-Return ONLY valid JSON:
+Return strictly valid JSON:
 {"matches": true/false, "imageCategory": "<what the image actually shows>", "confidence": <0-100>, "reason": "<brief reason>"}`;
 
-    const result = await visionModel.generateContent({
-      contents: [{
-        role: "user",
-        parts: [
-          { inlineData: { mimeType, data: base64Image } },
-          { text: prompt }
-        ]
-      }]
-    });
-
-    const raw = result.response.text().replace(/```json/g, "").replace(/```/g, "").trim();
-    const jsonStart = raw.indexOf("{");
-    const jsonEnd = raw.lastIndexOf("}") + 1;
-    const parsed = JSON.parse(raw.substring(jsonStart, jsonEnd));
+    const parsed = await callGeminiVision(base64Image, mimeType, prompt);
 
     res.json({
       matches: parsed.matches,
@@ -414,9 +1018,8 @@ Return ONLY valid JSON:
   }
 });
 
-
 // ===================================================
-// TRANSLATE ENDPOINT — On-demand letter translation
+// TRANSLATE ENDPOINT — Multi-Language Support
 // ===================================================
 router.post("/translate", async (req, res) => {
   try {
@@ -426,82 +1029,78 @@ router.post("/translate", async (req, res) => {
       return res.status(400).json({ message: "text and targetLanguage required" });
     }
 
-    // Validate language
     const lang = supportedLanguages.find((l) => l.code === targetLanguage);
     if (!lang) {
       return res.status(400).json({ message: `Unsupported language: ${targetLanguage}` });
     }
 
-    // If English, just return the original
     if (targetLanguage === "en") {
       return res.json({ translatedText: text, language: lang });
     }
 
-    let translatedText;
-    let lastError;
-    
-    // Use translationModel (plain text output) instead of textModel (JSON output)
     if (!translationModel) {
       return res.status(500).json({ message: "Translation model not available" });
     }
 
+    let translatedText;
+    let lastError;
+
     for (let i = 0; i < 3; i++) {
       try {
-        console.log(`Translation attempt ${i + 1}/3...`);
-        
+        console.log(`Translation attempt ${i + 1}/3 to ${lang.name}...`);
         const result = await translationModel.generateContent({
-          contents: [{
-            role: "user",
-            parts: [{
-              text: `Translate the following formal complaint letter into ${lang.name} (${lang.nativeName}).
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `Translate the following formal complaint letter into ${lang.name} (${lang.nativeName}).
 
-IMPORTANT RULES:
-- Maintain the EXACT same formal tone and structure
-- Keep the letter format (To, Subject, Body, Closing)
-- Translate ALL text including authority titles, greetings, and closings
-- Keep proper names (person names, place names) as-is but also add transliterated version in parentheses if helpful
-- Use formal/respectful language appropriate for official government correspondence
-- Do NOT add any extra text, explanation, or notes — return ONLY the translated letter
-- Do NOT wrap the output in JSON, markdown, or code blocks — return plain translated text only
+CRITICAL TRANSLATION RULES:
+- Maintain the EXACT formal tone and structure of the complaint letter
+- Preserve headers (To, Subject, Date, Salutation, Body paragraphs, Closing signoff)
+- Translate all formal vocabulary, department titles, and administrative phrases faithfully
+- Preserve person names, reference IDs, and specific place names accurately
+- Do NOT add any conversational remarks, introductions, explanations, or code blocks
+- Return ONLY the clean, translated plain text letter
 
-Letter to translate:
-${text}`
-            }]
-          }]
+Complaint Letter:
+${text}`,
+                },
+              ],
+            },
+          ],
         });
-        
+
         const response = await result.response;
         let rawTranslation = response.text().trim();
-        
-        // Clean any accidental markdown/code fences the model may add
-        rawTranslation = rawTranslation.replace(/^```[\w]*\n?/gm, '').replace(/```$/gm, '').trim();
-        
+        rawTranslation = rawTranslation
+          .replace(/^```[\w]*\n?/gm, "")
+          .replace(/```$/gm, "")
+          .trim();
+
         translatedText = rawTranslation;
-        console.log("✅ Translation Success");
         break;
       } catch (err) {
         lastError = err;
         const msg = err.message || "";
-        console.error(`❌ Translation attempt ${i + 1} failed:`, msg);
-        
-        if ((msg.includes("429") || msg.includes("quota") || msg.includes("rate") || msg.includes("Please retry")) && i < 2) {
+        if (
+          (msg.includes("429") ||
+            msg.includes("quota") ||
+            msg.includes("rate") ||
+            msg.includes("Please retry")) &&
+          i < 2
+        ) {
           const delay = Math.pow(2, i) * 3000;
-          console.log(`⏳ Rate limited. Waiting ${delay}ms...`);
           await sleep(delay);
-        } else if (msg.includes("safety") || msg.includes("blocked")) {
-          return res.json({ 
-            translatedText: text, 
-            language: lang,
-            warning: "Translation blocked by safety settings. Original text returned."
-          });
         } else {
           throw err;
         }
       }
     }
-    
+
     if (!translatedText) {
-      throw lastError || new Error("Failed to translate");
+      throw lastError || new Error("Failed to translate text.");
     }
 
     res.json({ translatedText, language: lang });

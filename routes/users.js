@@ -255,4 +255,30 @@ router.get("/can-submit/:uid", async (req, res) => {
   }
 });
 
+// 🚀 GET USER PROFILE PROXY (Adblocker & Hardened ROM Resilience)
+router.get("/profile/:uid", async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const userDoc = await admin.firestore().collection('users').doc(uid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    res.json({ id: userDoc.id, ...userDoc.data() });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 🚀 CREATE / UPDATE USER PROFILE PROXY
+router.post("/profile/:uid", async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const profileData = req.body;
+    await admin.firestore().collection('users').doc(uid).set(profileData, { merge: true });
+    res.json({ success: true, data: profileData });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 export default router;
