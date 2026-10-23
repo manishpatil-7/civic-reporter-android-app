@@ -14,43 +14,112 @@ import {
 const router = express.Router();
 
 /**
- * Reverse geocode using Nominatim (free, no API key)
+ * Reverse geocode using multi-provider strategy (Nominatim -> BigDataCloud)
  */
 async function reverseGeocode(lat, lng) {
+  // 1. Try Nominatim with timeout
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2&addressdetails=1&accept-language=en`;
     const response = await fetch(url, {
-      headers: { "User-Agent": "CivicReporter/1.0 (civic-reporter-app)" },
+      signal: controller.signal,
+      headers: { "User-Agent": "CivicReporter/1.0 (contact: support@civicreporter.in)" },
     });
-    const data = await response.json();
-    return data;
+    clearTimeout(timeout);
+    if (response.ok) {
+      const data = await response.json();
+      if (data && data.address) {
+        return extractNominatimAddress(data);
+      }
+    }
   } catch (err) {
-    console.error("Reverse geocode error:", err.message);
-    return null;
+    console.warn("Nominatim reverse geocode attempt failed, trying fallback:", err.message);
   }
+
+  // 2. High-speed, unthrottled fallback: BigDataCloud Reverse Geocoding
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    const bdcUrl = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`;
+    const bdcRes = await fetch(bdcUrl, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (bdcRes.ok) {
+      const bdcData = await bdcRes.json();
+      if (bdcData) {
+        return extractBigDataCloudAddress(bdcData);
+      }
+    }
+  } catch (err) {
+    console.error("BigDataCloud fallback failed:", err.message);
+  }
+
+  return null;
 }
 
 /**
  * Extract structured address components from Nominatim response
  */
-function extractAddress(nominatimData) {
+function extractNominatimAddress(nominatimData) {
   if (!nominatimData || !nominatimData.address) return null;
 
   const addr = nominatimData.address;
 
   return {
-    village: addr.village || addr.hamlet || "",
-    town: addr.town || "",
-    city: addr.city || "",
-    suburb: addr.suburb || addr.neighbourhood || "",
-    district: addr.county || addr.state_district || "",
-    taluka: addr.county || addr.state_district || "",
+    village: addr.village || addr.hamlet || addr.isolated_dwelling || "",
+    town: addr.town || addr.borough || "",
+    city: addr.city || addr.municipality || addr.city_district || "",
+    suburb: addr.suburb || addr.neighbourhood || addr.residential || "",
+    district: (addr.state_district || addr.county || addr.district || "").replace(/\s*district$/i, "").trim(),
+    taluka: (addr.county || addr.subdistrict || addr.state_district || "").replace(/\s*taluka$/i, "").trim(),
     state: addr.state || "",
     postcode: addr.postcode || "",
     country: addr.country || "India",
     placeType: nominatimData.type || "",
     placeClass: nominatimData.class || "",
     displayName: nominatimData.display_name || "",
+  };
+}
+
+/**
+ * Extract structured address from BigDataCloud response
+ */
+function extractBigDataCloudAddress(bdc) {
+  const adminList = bdc.localityInfo?.administrative || [];
+  
+  let district = "";
+  let taluka = "";
+  let cityOrTown = bdc.city || bdc.locality || "";
+  
+  for (const item of adminList) {
+    if (item.adminLevel === 5) {
+      district = item.name.replace(/\s*district$/i, "").trim();
+    }
+    if (item.adminLevel === 6) {
+      if (item.name.toLowerCase().includes("taluka")) {
+        taluka = item.name.replace(/\s*taluka$/i, "").trim();
+      } else if (!cityOrTown) {
+        cityOrTown = item.name;
+      }
+    }
+  }
+
+  const state = bdc.principalSubdivision || "";
+  const displayName = [cityOrTown, taluka, district, state].filter(Boolean).join(", ");
+
+  return {
+    village: bdc.locality || "",
+    town: bdc.locality || "",
+    city: cityOrTown || "",
+    suburb: "",
+    district: district || taluka || "",
+    taluka: taluka || district || "",
+    state: state,
+    postcode: bdc.postcode || "",
+    country: bdc.countryName || "India",
+    placeType: "locality",
+    placeClass: "",
+    displayName: displayName,
   };
 }
 
@@ -111,9 +180,9 @@ function hasUrbanKeywords(addressString) {
 function detectAuthority(structuredAddress) {
   if (!structuredAddress) {
     return {
-      authorityType: "gram_panchayat",
-      authorityTitle: "The Sarpanch",
-      authorityBody: "Gram Panchayat",
+      authorityType: "municipal_corporation",
+      authorityTitle: "The Municipal Officer",
+      authorityBody: "Local Civic Authority",
       confidence: 30,
       detectionMethod: "fallback",
     };
@@ -140,8 +209,7 @@ function detectAuthority(structuredAddress) {
   // Also check district name against corporations (e.g., "Kolhapur" district)
   if (district) {
     const corpByDistrict = matchInDataset(district, municipalCorporations);
-    // Only match if the city field is empty (meaning we're actually in/near the district HQ)
-    if (corpByDistrict && city && normalize(city) === normalize(corpByDistrict.name)) {
+    if (corpByDistrict && (!village || normalize(city) === normalize(corpByDistrict.name))) {
       return {
         authorityType: "municipal_corporation",
         authorityTitle: "The Municipal Commissioner",
@@ -154,8 +222,6 @@ function detectAuthority(structuredAddress) {
   }
 
   // Strategy 2: If Nominatim classifies as a village (no town/city), it's a Gram Panchayat
-  // This must run BEFORE council dataset matching to prevent misclassifying villages
-  // that might share names with towns in the dataset
   if (village && !town && !city) {
     return {
       authorityType: "gram_panchayat",
@@ -181,9 +247,6 @@ function detectAuthority(structuredAddress) {
     }
   }
 
-  // Strategy 4: Keyword-based detection
-  const fullAddress = displayName || [village, town, city, suburb, district, state].filter(Boolean).join(", ");
-
   // If the location has a "town" field, it's likely a Municipal Council
   if (town && !city) {
     return {
@@ -195,7 +258,7 @@ function detectAuthority(structuredAddress) {
     };
   }
 
-  // If the location has a "city" field, it could be a Municipal Corporation not in our dataset
+  // If the location has a "city" field, it could be a Municipal Corporation
   if (city) {
     return {
       authorityType: "municipal_corporation",
@@ -206,38 +269,14 @@ function detectAuthority(structuredAddress) {
     };
   }
 
-  // Strategy 4: Village keywords in address
-  if (hasVillageKeywords(fullAddress)) {
-    const placeName = village || town || suburb || "Unknown";
-    return {
-      authorityType: "gram_panchayat",
-      authorityTitle: "The Sarpanch",
-      authorityBody: `Gram Panchayat ${placeName}`,
-      confidence: 65,
-      detectionMethod: "keyword_village",
-    };
-  }
-
-  // Strategy 5: Urban keywords
-  if (hasUrbanKeywords(fullAddress)) {
-    const placeName = city || town || suburb || "Unknown";
-    return {
-      authorityType: "municipal_council",
-      authorityTitle: "The Chief Officer",
-      authorityBody: `Municipal Council ${placeName}`,
-      confidence: 60,
-      detectionMethod: "keyword_urban",
-    };
-  }
-
-  // Default fallback — Gram Panchayat (safer for rural India)
-  const placeName = village || town || suburb || city || "Unknown";
+  // Default fallback — Gram Panchayat or Local Civic Authority
+  const placeName = village || town || suburb || city || district || "Local Area";
   return {
     authorityType: "gram_panchayat",
     authorityTitle: "The Sarpanch",
     authorityBody: `Gram Panchayat ${placeName}`,
-    confidence: 40,
-    detectionMethod: "fallback",
+    confidence: 50,
+    detectionMethod: "fallback_rural",
   };
 }
 
@@ -285,8 +324,7 @@ router.post("/detect", async (req, res) => {
 
     // If lat/lng provided, reverse geocode
     if (lat && lng) {
-      nominatimRaw = await reverseGeocode(lat, lng);
-      structuredAddress = extractAddress(nominatimRaw);
+      structuredAddress = await reverseGeocode(lat, lng);
     }
 
     // If structured address components provided directly
