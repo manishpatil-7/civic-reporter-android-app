@@ -33,12 +33,26 @@ async function reverseGeocode(lat, lng) {
     if (!data || !data.address) return null;
 
     const addr = data.address;
+    let dist = (addr.county || addr.district || "").replace(/\s*district$/i, "").trim();
+    if (!dist || /division/i.test(dist)) {
+      dist = (addr.state_district && !/division/i.test(addr.state_district))
+        ? addr.state_district.replace(/\s*district$/i, "").trim()
+        : "Kolhapur";
+    }
+
+    let cleanFull = (data.display_name || "")
+      .replace(/,?\s*(?:in\s+)?[A-Za-z]+\s+division\b/gi, "")
+      .replace(/\bdivision\b/gi, "")
+      .replace(/\s*,\s*,/g, ", ")
+      .replace(/^[\s,]+|[\s,]+$/g, "")
+      .trim();
+
     return {
       state: addr.state || "",
-      district: addr.county || addr.state_district || "",
+      district: dist,
       city: addr.city || addr.town || addr.village || "",
       area: addr.suburb || addr.neighbourhood || addr.hamlet || "",
-      fullAddress: data.display_name || "",
+      fullAddress: cleanFull,
       village: addr.village || "",
       town: addr.town || "",
       postcode: addr.postcode || "",

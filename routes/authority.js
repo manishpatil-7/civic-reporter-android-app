@@ -77,8 +77,23 @@ function extractNominatimAddress(nominatimData) {
     town: addr.town || addr.borough || "",
     city: addr.city || addr.municipality || addr.city_district || "",
     suburb: addr.suburb || addr.neighbourhood || addr.residential || "",
-    district: (addr.state_district || addr.county || addr.district || "").replace(/\s*district$/i, "").trim(),
-    taluka: (addr.county || addr.subdistrict || addr.state_district || "").replace(/\s*taluka$/i, "").trim(),
+  let district = (addr.county || addr.district || "").replace(/\s*district$/i, "").trim();
+  if (!district || /division/i.test(district)) {
+    district = (addr.state_district && !/division/i.test(addr.state_district))
+      ? addr.state_district.replace(/\s*district$/i, "").trim()
+      : "Kolhapur";
+  }
+
+  let taluka = (addr.county || addr.subdistrict || "").replace(/\s*taluka$/i, "").trim();
+  if (/division/i.test(taluka)) taluka = "";
+
+  return {
+    village: addr.village || addr.hamlet || addr.isolated_dwelling || "",
+    town: addr.town || addr.borough || "",
+    city: addr.city || addr.municipality || addr.city_district || "",
+    suburb: addr.suburb || addr.neighbourhood || addr.residential || "",
+    district: district,
+    taluka: taluka,
     state: addr.state || "",
     postcode: addr.postcode || "",
     country: addr.country || "India",
@@ -111,16 +126,17 @@ function extractBigDataCloudAddress(bdc) {
     }
   }
 
+  const cleanDist = (district && !/division/i.test(district)) ? district : "Kolhapur";
   const state = bdc.principalSubdivision || "";
-  const displayName = [cityOrTown, taluka, district, state].filter(Boolean).join(", ");
+  const displayName = [cityOrTown, taluka, cleanDist, state].filter(Boolean).join(", ");
 
   return {
     village: bdc.locality || "",
     town: bdc.locality || "",
     city: cityOrTown || "",
     suburb: "",
-    district: district || taluka || "",
-    taluka: taluka || district || "",
+    district: cleanDist,
+    taluka: taluka || cleanDist || "",
     state: state,
     postcode: bdc.postcode || "",
     country: bdc.countryName || "India",
@@ -182,27 +198,34 @@ function hasUrbanKeywords(addressString) {
 }
 
 /**
- * Clean string to remove any Division contamination (e.g. Pune Division)
+ * Clean string to remove any Division contamination (e.g. Pune Division) and duplicate authority words
  */
 export function cleanAddressString(addrStr) {
   if (!addrStr || typeof addrStr !== "string") return "";
   return addrStr
-    .replace(/,?\s*[^,]*\bdivision\b[^,]*/gi, "")
+    .replace(/,?\s*(?:in\s+)?[A-Za-z]+\s+division\b/gi, "")
+    .replace(/\bdivision\b/gi, "")
+    .replace(/\b(?:mun[a-z]+)\s+corporation\b/gi, "")
+    .replace(/\b(?:mun[a-z]+)\s+council\b/gi, "")
+    .replace(/\b(?:gram\s+panchayat|nagar\s+palika|nagar\s+parishad|mahanagar\s+palika)\b/gi, "")
     .replace(/,?\s*[A-Z0-9]{2,}-[A-Z0-9]+/g, "")
     .replace(/\s*,\s*,/g, ", ")
-    .replace(/^[\s,]+|[\s,]+$/g, "");
+    .replace(/^[\s,]+|[\s,]+$/g, "")
+    .trim();
 }
 
 /**
- * Clean and filter place names (removes asset IDs, pole IDs, plus codes, survey numbers, divisions)
+ * Clean and filter place names (removes asset IDs, pole IDs, plus codes, survey numbers, divisions, authority words)
  */
 export function cleanPlaceName(name) {
   if (!name || typeof name !== "string") return "";
   let trimmed = name.trim();
-  // Strip out "Pune Division" or "Kolhapur Division" or "in Pune Division" or "Division"
   trimmed = trimmed
     .replace(/,?\s*(?:in\s+)?[A-Za-z]+\s+division\b/gi, "")
     .replace(/\bdivision\b/gi, "")
+    .replace(/\b(?:mun[a-z]+)\s+corporation\b/gi, "")
+    .replace(/\b(?:mun[a-z]+)\s+council\b/gi, "")
+    .replace(/\b(?:gram\s+panchayat|nagar\s+palika|nagar\s+parishad|mahanagar\s+palika)\b/gi, "")
     .replace(/,?\s*[A-Z0-9]{2,}-[A-Z0-9]+/g, "")
     .replace(/\s*,\s*,/g, ", ")
     .replace(/^[\s,]+|[\s,]+$/g, "")
