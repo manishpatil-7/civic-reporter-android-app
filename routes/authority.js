@@ -329,13 +329,14 @@ router.post("/detect", async (req, res) => {
 
     // If structured address components provided directly from mobile client
     if (address && typeof address === "object") {
+      const hasCity = Boolean(address.city);
       structuredAddress = {
-        village: address.village || address.subLocality || address.name || "",
+        village: address.village || (!hasCity ? (address.subLocality || address.name) : "") || "",
         town: address.town || "",
         city: address.city || "",
-        suburb: address.suburb || address.district || "",
-        district: address.district || address.city || "",
-        taluka: address.taluka || address.subregion || address.district || "",
+        suburb: address.suburb || (hasCity ? (address.subLocality || address.name) : "") || "",
+        district: address.district || "",
+        taluka: address.taluka || address.subregion || "",
         state: address.state || address.region || "",
         postcode: address.postcode || address.postalCode || "",
         country: "India",
