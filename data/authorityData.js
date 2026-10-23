@@ -250,11 +250,9 @@ export const municipalCouncils = [
 // ============================================================
 // KEYWORD-BASED CLASSIFICATION HINTS
 // ============================================================
-// Words that suggest rural/village origins
 export const villageKeywords = [
-  "wadi", "gaon", "gad", "khurd", "budruk", "tarf", "pada", "pura",
-  "pur", "garh", "gram", "village", "hamlet", "nagar panchayat",
-  "basthi", "tola", "basti", "majra", "dhani", "faliya"
+  "wadi", "gaon", "khurd", "budruk", "tarf", "pada", "gram", "village", "hamlet",
+  "nagar panchayat", "basthi", "tola", "basti", "majra", "dhani", "faliya"
 ];
 
 // Words that suggest urban/city

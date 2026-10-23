@@ -241,20 +241,24 @@ router.get("/status", async (req, res) => {
 
 router.get("/diag-yolo", async (req, res) => {
   try {
-    const { promisify } = await import("util");
-    const { execFile } = await import("child_process");
-    const execFileAsync = promisify(execFile);
-    const pythonCmd = process.platform === "win32" ? "python" : "python3";
-
-    const testScript = "import sys\ntry:\n    import torch\n    print(f'torch: {torch.__version__}')\nexcept Exception as e:\n    print(f'torch error: {e}')\ntry:\n    from ultralytics import YOLO\n    print('ultralytics import ok')\n    m = YOLO('./models/pothole_best.pt')\n    print(f'pothole model load ok: {m.names}')\nexcept Exception as e:\n    print(f'YOLO load error: {e}')\n";
-
-    const { stdout, stderr } = await execFileAsync(pythonCmd, ["-c", testScript], {
-      timeout: 25000,
+    const testUrl = req.query.url || "https://images.unsplash.com/photo-1515162816999-a0c47dc192f7";
+    const startTime = Date.now();
+    const yoloResult = await runYoloInference({
+      imageUrl: testUrl,
+      modelType: req.query.model || "pothole",
+      confidenceThreshold: 0.25,
     });
-
-    res.json({ stdout, stderr });
+    const duration = Date.now() - startTime;
+    res.json({
+      durationMs: duration,
+      yoloResult,
+      modelsAvailable: checkLocalModelsAvailable(),
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message, stderr: err.stderr, stdout: err.stdout });
+    res.status(500).json({
+      error: err.message,
+      stack: err.stack,
+    });
   }
 });
 

@@ -182,9 +182,21 @@ function hasUrbanKeywords(addressString) {
 }
 
 /**
- * Clean and filter place names (removes asset IDs, pole IDs, plus codes, survey numbers)
+ * Clean string to remove any Division contamination (e.g. Pune Division)
  */
-function cleanPlaceName(name) {
+export function cleanAddressString(addrStr) {
+  if (!addrStr || typeof addrStr !== "string") return "";
+  return addrStr
+    .replace(/,?\s*[^,]*\bdivision\b[^,]*/gi, "")
+    .replace(/,?\s*[A-Z0-9]{2,}-[A-Z0-9]+/g, "")
+    .replace(/\s*,\s*,/g, ", ")
+    .replace(/^[\s,]+|[\s,]+$/g, "");
+}
+
+/**
+ * Clean and filter place names (removes asset IDs, pole IDs, plus codes, survey numbers, divisions)
+ */
+export function cleanPlaceName(name) {
   if (!name || typeof name !== "string") return "";
   const trimmed = name.trim();
   // Filter out machine codes, plus codes, survey numbers, asset IDs like HPSBA-C393743
@@ -193,19 +205,20 @@ function cleanPlaceName(name) {
   if (/^[0-9]+/.test(trimmed)) return ""; // Starts with numbers like street/door/plot
   if (/\+/.test(trimmed)) return ""; // Plus codes like 8F7X+9Q
   if (/^road|^street|^lane|^gali|^marg|^plot|^survey|^sector/i.test(trimmed)) return "";
+  if (/division$/i.test(trimmed) || /division\b/i.test(trimmed)) return ""; // Filter out Pune Division
   return trimmed;
 }
 
 /**
  * Main authority detection logic
  */
-function detectAuthority(structuredAddress) {
+export function detectAuthority(structuredAddress) {
   if (!structuredAddress) {
     return {
       authorityType: "municipal_corporation",
-      authorityTitle: "The Municipal Officer",
-      authorityBody: "Local Civic Authority",
-      confidence: 30,
+      authorityTitle: "The Municipal Commissioner",
+      authorityBody: "Municipal Corporation Kolhapur",
+      confidence: 50,
       detectionMethod: "fallback",
     };
   }
@@ -216,7 +229,89 @@ function detectAuthority(structuredAddress) {
   const suburb = cleanPlaceName(structuredAddress.suburb);
   const district = cleanPlaceName(structuredAddress.district);
 
-  // Strategy 1: Direct match city against Municipal Corporations
+  // List of known Gram Panchayats in Kolhapur district and surrounding rural areas
+  const knownGramPanchayats = [
+    "shinganapur", "singanapur", "shingnapur", "padli khurd", "padli budruk", "padli",
+    "balinge", "shiroli", "uchgaon", "uchgoan", "vadanage", "vadange", "nigave",
+    "chikhali", "kerli", "prayag chikhali", "gandhinagar", "kalamba",
+    "pachgaon", "pachgoan", "morewadi", "gokul shirgaon", "tamgaon",
+    "halondi", "mudshingi", "vasagade", "sarnobatwadi", "girgaon",
+    "kandgaon", "ambewadi", "kagal", "hatkanangle", "rukadi"
+  ];
+
+  // List of known urban wards inside Kolhapur Municipal Corporation (KMC)
+  const knownKolhapurUrbanWards = [
+    "shahupuri", "rajarampuri", "laxmipuri", "tarabai park", "kasba bawada",
+    "phulewadi", "rankala", "mangalwar peth", "somwar peth", "shivaji peth",
+    "shukrawar peth", "raviwar peth", "budhwar peth", "guruwar peth", "sambhajinagar",
+    "ruikar colony", "nagala park", "kadamwadi", "sasane nagar", "line bazar",
+    "pratibha nagar", "dabholkar corner", "station road", "cbs", "mahadwar road",
+    "bindu chowk", "dasara chowk", "bhavani mandap"
+  ];
+
+  const candidatePlaces = [village, suburb, town, city].filter(Boolean);
+
+  // Strategy 1: Check known urban wards inside Kolhapur city first
+  for (const place of candidatePlaces) {
+    const norm = normalize(place);
+    if (knownKolhapurUrbanWards.some((w) => norm === w || norm.includes(w) || w.includes(norm))) {
+      return {
+        authorityType: "municipal_corporation",
+        authorityTitle: "The Municipal Commissioner",
+        authorityBody: "Municipal Corporation Kolhapur",
+        confidence: 99,
+        detectionMethod: "kmc_urban_ward",
+      };
+    }
+  }
+
+  // Strategy 2: Direct match with known Gram Panchayats
+  for (const place of candidatePlaces) {
+    const norm = normalize(place);
+    if (knownGramPanchayats.some((gp) => norm === gp || norm.includes(gp) || gp.includes(norm))) {
+      return {
+        authorityType: "gram_panchayat",
+        authorityTitle: "The Sarpanch",
+        authorityBody: `Gram Panchayat ${place}`,
+        confidence: 99,
+        detectionMethod: "known_gram_panchayat_list",
+      };
+    }
+  }
+
+  // Strategy 2: If place has village keywords (like "khurd", "budruk", "pur", "wadi", "gaon", etc.)
+  for (const place of [village, suburb, town]) {
+    if (place && hasVillageKeywords(place)) {
+      const corpMatch = matchInDataset(place, municipalCorporations);
+      const councilMatch = matchInDataset(place, municipalCouncils);
+      if (!corpMatch && !councilMatch) {
+        return {
+          authorityType: "gram_panchayat",
+          authorityTitle: "The Sarpanch",
+          authorityBody: `Gram Panchayat ${place}`,
+          confidence: 95,
+          detectionMethod: "village_keyword_match",
+        };
+      }
+    }
+  }
+
+  // Strategy 3: Check if town matches a Municipal Council
+  if (town) {
+    const councilMatch = matchInDataset(town, municipalCouncils);
+    if (councilMatch) {
+      return {
+        authorityType: "municipal_council",
+        authorityTitle: "The Chief Officer",
+        authorityBody: `Municipal Council ${councilMatch.name}`,
+        confidence: 95,
+        detectionMethod: "dataset_council_town",
+        matchedEntry: councilMatch,
+      };
+    }
+  }
+
+  // Strategy 4: Check if city matches a Municipal Corporation
   if (city) {
     const corpMatch = matchInDataset(city, municipalCorporations);
     if (corpMatch) {
@@ -229,9 +324,21 @@ function detectAuthority(structuredAddress) {
         matchedEntry: corpMatch,
       };
     }
+
+    const councilMatch = matchInDataset(city, municipalCouncils);
+    if (councilMatch) {
+      return {
+        authorityType: "municipal_council",
+        authorityTitle: "The Chief Officer",
+        authorityBody: `Municipal Council ${councilMatch.name}`,
+        confidence: 90,
+        detectionMethod: "dataset_council_city",
+        matchedEntry: councilMatch,
+      };
+    }
   }
 
-  // Strategy 2: Direct match suburb against Municipal Corporations
+  // Strategy 5: Check suburb against corporations
   if (suburb) {
     const corpMatch = matchInDataset(suburb, municipalCorporations);
     if (corpMatch) {
@@ -239,87 +346,31 @@ function detectAuthority(structuredAddress) {
         authorityType: "municipal_corporation",
         authorityTitle: "The Municipal Commissioner",
         authorityBody: `Municipal Corporation ${corpMatch.name}`,
-        confidence: 95,
+        confidence: 90,
         detectionMethod: "dataset_corporation_suburb",
         matchedEntry: corpMatch,
       };
     }
   }
 
-  // Strategy 3: Direct match town against Municipal Councils
-  if (town) {
-    const councilMatch = matchInDataset(town, municipalCouncils);
-    if (councilMatch) {
-      return {
-        authorityType: "municipal_council",
-        authorityTitle: "The Chief Officer",
-        authorityBody: `Municipal Council ${councilMatch.name}`,
-        confidence: 90,
-        detectionMethod: "dataset_council",
-        matchedEntry: councilMatch,
-      };
-    }
-  }
-
-  // Strategy 4: If genuine rural village name is present (outside city corporation), it's a Gram Panchayat
-  if (village && normalize(village) !== normalize(city)) {
-    const corpMatch = matchInDataset(village, municipalCorporations);
-    const councilMatch = matchInDataset(village, municipalCouncils);
-    if (!corpMatch && !councilMatch) {
-      return {
-        authorityType: "gram_panchayat",
-        authorityTitle: "The Sarpanch",
-        authorityBody: `Gram Panchayat ${village}`,
-        confidence: 90,
-        detectionMethod: "village_priority",
-      };
-    }
-  }
-
-  // Strategy 5: If location has a "town" field
-  if (town && !city) {
+  // Strategy 6: If village is specified and not corp/council, it's Gram Panchayat
+  if (village) {
     return {
-      authorityType: "municipal_council",
-      authorityTitle: "The Chief Officer",
-      authorityBody: `Municipal Council ${town}`,
-      confidence: 75,
-      detectionMethod: "nominatim_town_field",
+      authorityType: "gram_panchayat",
+      authorityTitle: "The Sarpanch",
+      authorityBody: `Gram Panchayat ${village}`,
+      confidence: 90,
+      detectionMethod: "village_field_priority",
     };
   }
 
-  // Strategy 6: If location has a "city" field
-  if (city) {
-    return {
-      authorityType: "municipal_corporation",
-      authorityTitle: "The Municipal Commissioner",
-      authorityBody: `Municipal Corporation ${city}`,
-      confidence: 70,
-      detectionMethod: "nominatim_city_field",
-    };
-  }
-
-  // Strategy 7: Check district name against corporations if no specific village/town
-  if (district && !village && !town) {
-    const corpByDistrict = matchInDataset(district, municipalCorporations);
-    if (corpByDistrict) {
-      return {
-        authorityType: "municipal_corporation",
-        authorityTitle: "The Municipal Commissioner",
-        authorityBody: `Municipal Corporation ${corpByDistrict.name}`,
-        confidence: 75,
-        detectionMethod: "dataset_corporation_district",
-        matchedEntry: corpByDistrict,
-      };
-    }
-  }
-
-  // Default fallback — Gram Panchayat or Local Civic Authority
-  const placeName = village || town || suburb || city || district || "Local Area";
+  // Default fallback: Gram Panchayat
+  const placeName = suburb || village || town || city || "Kolhapur";
   return {
     authorityType: "gram_panchayat",
     authorityTitle: "The Sarpanch",
     authorityBody: `Gram Panchayat ${placeName}`,
-    confidence: 50,
+    confidence: 60,
     detectionMethod: "fallback_rural",
   };
 }
@@ -327,27 +378,19 @@ function detectAuthority(structuredAddress) {
 /**
  * Generate the formal letter header based on authority
  */
-function generateLetterHeader(authorityResult, structuredAddress) {
-  const { authorityType, authorityTitle, authorityBody } = authorityResult;
+export function generateLetterHeader(authorityResult, structuredAddress) {
+  const { authorityTitle, authorityBody } = authorityResult;
   const addr = structuredAddress || {};
-  const v = cleanPlaceName(addr.village);
-  const sub = cleanPlaceName(addr.suburb);
-  const t = cleanPlaceName(addr.town);
-  const dist = cleanPlaceName(addr.district);
-  const st = cleanPlaceName(addr.state);
+  let dist = cleanPlaceName(addr.district);
+  if (!dist || /division/i.test(dist)) dist = "Kolhapur";
+  const st = cleanPlaceName(addr.state) || "Maharashtra";
 
-  if (authorityType === "gram_panchayat") {
-    const talukaLine = addr.taluka ? `Taluka ${cleanPlaceName(addr.taluka)},\n` : "";
-    const districtLine = dist ? `District ${dist}` : "";
-    const stateLine = st ? `, ${st}` : "";
-
-    return `To,\n${authorityTitle},\n${authorityBody},\n${talukaLine}${districtLine}${stateLine}`;
+  if (authorityResult.authorityType === "gram_panchayat") {
+    const talukaLine = addr.taluka && !/division/i.test(addr.taluka) ? `Taluka ${cleanPlaceName(addr.taluka)},\n` : "";
+    return `To,\n${authorityTitle},\n${authorityBody},\n${talukaLine}District ${dist}, ${st}`;
   }
 
-  const districtLine = dist ? `\nDistrict ${dist}` : "";
-  const stateLine = st ? `, ${st}` : "";
-
-  return `To,\n${authorityTitle},\n${authorityBody},${districtLine}${stateLine}`;
+  return `To,\n${authorityTitle},\n${authorityBody},\nDistrict ${dist}, ${st}`;
 }
 
 // ===================================================
@@ -364,12 +407,13 @@ router.post("/detect", async (req, res) => {
     // If structured address components provided directly from mobile client
     if (address && typeof address === "object") {
       const v = cleanPlaceName(address.village || address.subLocality || address.name);
-      const sub = cleanPlaceName(address.suburb || address.subLocality);
+      const sub = cleanPlaceName(address.suburb || address.subLocality || address.name);
       const c = cleanPlaceName(address.city);
       const t = cleanPlaceName(address.town);
-      const dist = cleanPlaceName(address.district);
-      const tal = cleanPlaceName(address.taluka || address.subregion);
-      const st = cleanPlaceName(address.state || address.region);
+      let dist = cleanPlaceName(address.district);
+      if (!dist || /division/i.test(dist)) dist = "Kolhapur";
+      const tal = cleanPlaceName(address.taluka);
+      const st = cleanPlaceName(address.state || address.region) || "Maharashtra";
 
       structuredAddress = {
         village: v,
@@ -383,15 +427,29 @@ router.post("/detect", async (req, res) => {
         country: "India",
         placeType: "",
         placeClass: "",
-        displayName: address.formattedAddress || address.displayName || "",
+        displayName: cleanAddressString(address.formattedAddress || address.displayName || ""),
       };
     }
 
-    // If lat/lng provided and address wasn't passed or is missing key fields, reverse geocode
-    if ((!structuredAddress || (!structuredAddress.village && !structuredAddress.city)) && lat && lng) {
-      const geo = await reverseGeocode(lat, lng);
-      if (geo) {
-        structuredAddress = { ...(structuredAddress || {}), ...geo };
+    // Always reverse geocode using server polygons to get precise village / municipal boundary
+    if (lat && lng) {
+      try {
+        const geo = await reverseGeocode(lat, lng);
+        if (geo) {
+          structuredAddress = {
+            village: geo.village || structuredAddress?.village || "",
+            town: geo.town || structuredAddress?.town || "",
+            city: geo.city || structuredAddress?.city || "",
+            suburb: geo.suburb || structuredAddress?.suburb || "",
+            district: geo.district && !/division/i.test(geo.district) ? geo.district : (structuredAddress?.district || "Kolhapur"),
+            taluka: geo.taluka && !/division/i.test(geo.taluka) ? geo.taluka : (structuredAddress?.taluka || ""),
+            state: geo.state || structuredAddress?.state || "Maharashtra",
+            postcode: geo.postcode || structuredAddress?.postcode || "",
+            displayName: cleanAddressString(geo.displayName || structuredAddress?.displayName || ""),
+          };
+        }
+      } catch (geoErr) {
+        console.warn("Server reverse geocode failed:", geoErr.message);
       }
     }
 
@@ -401,25 +459,25 @@ router.post("/detect", async (req, res) => {
     // Generate letter header
     const letterHeader = generateLetterHeader(authorityResult, structuredAddress);
 
-    // Build clean display address
+    // Build clean display address without "Pune Division"
     const parts = [];
     if (structuredAddress) {
       const v = cleanPlaceName(structuredAddress.village);
       const sub = cleanPlaceName(structuredAddress.suburb);
       const t = cleanPlaceName(structuredAddress.town);
       const c = cleanPlaceName(structuredAddress.city);
-      const tal = cleanPlaceName(structuredAddress.taluka);
-      const dist = cleanPlaceName(structuredAddress.district);
-      const st = cleanPlaceName(structuredAddress.state);
+      const dist = cleanPlaceName(structuredAddress.district) || "Kolhapur";
+      const st = cleanPlaceName(structuredAddress.state) || "Maharashtra";
 
-      if (sub) parts.push(sub);
-      else if (v) parts.push(v);
+      if (v) parts.push(v);
+      else if (sub) parts.push(sub);
       if (t && !parts.includes(t)) parts.push(t);
-      if (c && !parts.includes(c)) parts.push(c);
-      if (tal && !parts.includes(tal) && tal !== c) parts.push(tal);
-      if (dist && !parts.includes(dist) && dist !== c) parts.push(dist);
+      if (c && !parts.includes(c) && !v) parts.push(c);
+      if (dist && !parts.includes(dist) && !/division/i.test(dist)) parts.push(dist);
       if (st && !parts.includes(st)) parts.push(st);
     }
+
+    const cleanDisplay = cleanAddressString(parts.join(", ")) || "Kolhapur, Maharashtra";
 
     res.json({
       authorityType: authorityResult.authorityType,
@@ -429,7 +487,7 @@ router.post("/detect", async (req, res) => {
       detectionMethod: authorityResult.detectionMethod,
       letterHeader,
       address: structuredAddress,
-      displayAddress: parts.join(", ") || "Unknown Location",
+      displayAddress: cleanDisplay,
     });
   } catch (error) {
     console.error("Authority detection error:", error.message);

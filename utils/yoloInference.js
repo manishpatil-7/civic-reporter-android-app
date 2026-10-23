@@ -120,38 +120,39 @@ export async function runYoloInference({
   let tempFilePath = null;
 
   try {
-    // 1. Try FastAPI HTTP Service
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), INFERENCE_CONFIG.httpTimeoutMs);
+    // 1. Try FastAPI HTTP Service only if explicitly configured
+    if (process.env.USE_YOLO_HTTP === "true" && INFERENCE_CONFIG.yoloInferenceUrl) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), INFERENCE_CONFIG.httpTimeoutMs);
 
-      const formData = new FormData();
-      formData.append("model_type", modelType);
-      formData.append("confidence_threshold", String(threshold));
+        const formData = new FormData();
+        formData.append("model_type", modelType);
+        formData.append("confidence_threshold", String(threshold));
 
-      if (imageBuffer) {
-        const blob = new Blob([imageBuffer]);
-        formData.append("file", blob, "upload.jpg");
-      } else if (imageUrl) {
-        formData.append("image_url", imageUrl);
-      } else if (imagePath) {
-        formData.append("image_path", imagePath);
+        if (imageBuffer) {
+          const blob = new Blob([imageBuffer]);
+          formData.append("file", blob, "upload.jpg");
+        } else if (imageUrl) {
+          formData.append("image_url", imageUrl);
+        } else if (imagePath) {
+          formData.append("image_path", imagePath);
+        }
+
+        const res = await fetch(`${INFERENCE_CONFIG.yoloInferenceUrl}/detect`, {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (res.ok) {
+          const result = await res.json();
+          return result;
+        }
+      } catch (httpErr) {
+        console.log(`⚠️ YOLO HTTP service unavailable (${httpErr.message}). Falling back to local CLI...`);
       }
-
-      const res = await fetch(`${INFERENCE_CONFIG.yoloInferenceUrl}/detect`, {
-        method: "POST",
-        body: formData,
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-
-      if (res.ok) {
-        const result = await res.json();
-        return result;
-      }
-    } catch (httpErr) {
-      // HTTP service offline or timed out -> fall back to CLI runner
-      console.log(`⚠️ YOLO HTTP service unavailable (${httpErr.message}). Falling back to local CLI...`);
     }
 
     // 2. Prepare local file for CLI runner

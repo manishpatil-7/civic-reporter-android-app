@@ -45,7 +45,7 @@ def main():
             return [], 0.0
         try:
             model = YOLO(model_path)
-            results = model.predict(source=img, conf=args.conf, verbose=False)
+            results = model.predict(source=img, imgsz=640, conf=args.conf, verbose=False)
             dets = []
             if len(results) > 0 and results[0].boxes is not None:
                 for box in results[0].boxes:

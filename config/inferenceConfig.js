@@ -20,8 +20,8 @@ export const INFERENCE_CONFIG = {
   highConfidenceThreshold: 0.35,
 
   // Timeouts (milliseconds)
-  httpTimeoutMs: 12000,
-  cliTimeoutMs: 25000,
+  httpTimeoutMs: 1000,
+  cliTimeoutMs: 65000,
   
   // Supported issue categories
   categories: {
