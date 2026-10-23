@@ -78,9 +78,6 @@ function initWorker() {
   }
 }
 
-// Pre-warm worker on application load
-initWorker();
-
 /**
  * Executes inference through the persistent in-memory worker.
  */

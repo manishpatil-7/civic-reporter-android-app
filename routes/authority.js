@@ -437,15 +437,15 @@ router.post("/detect", async (req, res) => {
         const geo = await reverseGeocode(lat, lng);
         if (geo) {
           structuredAddress = {
-            village: geo.village || structuredAddress?.village || "",
-            town: geo.town || structuredAddress?.town || "",
-            city: geo.city || structuredAddress?.city || "",
-            suburb: geo.suburb || structuredAddress?.suburb || "",
-            district: geo.district && !/division/i.test(geo.district) ? geo.district : (structuredAddress?.district || "Kolhapur"),
-            taluka: geo.taluka && !/division/i.test(geo.taluka) ? geo.taluka : (structuredAddress?.taluka || ""),
-            state: geo.state || structuredAddress?.state || "Maharashtra",
-            postcode: geo.postcode || structuredAddress?.postcode || "",
-            displayName: cleanAddressString(geo.displayName || structuredAddress?.displayName || ""),
+            village: structuredAddress?.village || geo.village || "",
+            town: structuredAddress?.town || geo.town || "",
+            city: structuredAddress?.city || geo.city || "",
+            suburb: structuredAddress?.suburb || geo.suburb || "",
+            district: structuredAddress?.district && !/division/i.test(structuredAddress.district) ? structuredAddress.district : (geo.district && !/division/i.test(geo.district) ? geo.district : "Kolhapur"),
+            taluka: structuredAddress?.taluka && !/division/i.test(structuredAddress.taluka) ? structuredAddress.taluka : (geo.taluka && !/division/i.test(geo.taluka) ? geo.taluka : ""),
+            state: structuredAddress?.state || geo.state || "Maharashtra",
+            postcode: structuredAddress?.postcode || geo.postcode || "",
+            displayName: cleanAddressString(structuredAddress?.displayName || geo.displayName || ""),
           };
         }
       } catch (geoErr) {

@@ -1,45 +1,51 @@
 import os
 import sys
-import json
+import gc
 
-# Silence verbose Ultralytics and PyTorch stdout logs
+# Strict single-thread memory containment for Render 512MB RAM tier
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["YOLO_VERBOSE"] = "False"
 os.environ["ULTRALYTICS_VERBOSE"] = "False"
 
+import json
 from PIL import Image
-from ultralytics import YOLO
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 POTHOLE_PATH = os.environ.get("POTHOLE_MODEL_PATH", os.path.join(MODELS_DIR, "pothole_best.pt"))
 GARBAGE_PATH = os.environ.get("GARBAGE_MODEL_PATH", os.path.join(MODELS_DIR, "garbage_best.pt"))
 
-pothole_model = None
-garbage_model = None
+# Lazy cache for loaded models (keeps RAM under 200MB)
+models_cache = {}
 
-try:
-    if os.path.exists(POTHOLE_PATH):
-        pothole_model = YOLO(POTHOLE_PATH)
-        sys.stderr.write(f"Worker: Pothole model loaded from {POTHOLE_PATH}\n")
-    else:
-        sys.stderr.write(f"Worker: Pothole model not found at {POTHOLE_PATH}\n")
-except Exception as e:
-    sys.stderr.write(f"Worker: Error loading pothole model: {e}\n")
+def get_yolo_model(model_type):
+    from ultralytics import YOLO
+    import torch
+    torch.set_num_threads(1)
 
-try:
-    if os.path.exists(GARBAGE_PATH):
-        garbage_model = YOLO(GARBAGE_PATH)
-        sys.stderr.write(f"Worker: Garbage model loaded from {GARBAGE_PATH}\n")
-    else:
-        sys.stderr.write(f"Worker: Garbage model not found at {GARBAGE_PATH}\n")
-except Exception as e:
-    sys.stderr.write(f"Worker: Error loading garbage model: {e}\n")
+    if model_type == "pothole":
+        if "pothole" not in models_cache:
+            if os.path.exists(POTHOLE_PATH):
+                models_cache["pothole"] = YOLO(POTHOLE_PATH)
+                sys.stderr.write(f"Worker: Loaded pothole model from {POTHOLE_PATH}\n")
+        return models_cache.get("pothole")
+    elif model_type == "garbage":
+        if "garbage" not in models_cache:
+            if os.path.exists(GARBAGE_PATH):
+                models_cache["garbage"] = YOLO(GARBAGE_PATH)
+                sys.stderr.write(f"Worker: Loaded garbage model from {GARBAGE_PATH}\n")
+        return models_cache.get("garbage")
+    return None
 
-# Signal to Node.js that the persistent worker is warmed up and ready in RAM
+# Signal instantly to Node.js that the worker process is online (no heavy memory load at boot)
 sys.stdout.write(json.dumps({
     "status": "ready",
-    "pothole": pothole_model is not None,
-    "garbage": garbage_model is not None
+    "pothole": os.path.exists(POTHOLE_PATH),
+    "garbage": os.path.exists(GARBAGE_PATH)
 }) + "\n")
 sys.stdout.flush()
 
@@ -74,7 +80,6 @@ def run_model_inference(model, img, conf_threshold, target_label):
     max_c = dets[0]["confidence"] if dets else 0.0
     return dets, max_c
 
-# Read JSON requests line-by-line from Node.js stdin
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -99,11 +104,15 @@ for line in sys.stdin:
         pothole_dets, pothole_max_conf = [], 0.0
         garbage_dets, garbage_max_conf = [], 0.0
 
-        if model_type in ["pothole", "both"] and pothole_model:
-            pothole_dets, pothole_max_conf = run_model_inference(pothole_model, img, conf, "Pothole")
+        if model_type in ["pothole", "both"]:
+            p_model = get_yolo_model("pothole")
+            if p_model:
+                pothole_dets, pothole_max_conf = run_model_inference(p_model, img, conf, "Pothole")
 
-        if model_type in ["garbage", "both"] and garbage_model:
-            garbage_dets, garbage_max_conf = run_model_inference(garbage_model, img, conf, "Garbage accumulation")
+        if model_type in ["garbage", "both"]:
+            g_model = get_yolo_model("garbage")
+            if g_model:
+                garbage_dets, garbage_max_conf = run_model_inference(g_model, img, conf, "Garbage accumulation")
 
         chosen_model = "none"
         chosen_label = "None"
@@ -153,6 +162,9 @@ for line in sys.stdin:
         }
         sys.stdout.write(json.dumps(out) + "\n")
         sys.stdout.flush()
+
+        # Clean memory after inference
+        gc.collect()
     except Exception as e:
         sys.stdout.write(json.dumps({"id": req_id, "success": False, "error": str(e)}) + "\n")
         sys.stdout.flush()
